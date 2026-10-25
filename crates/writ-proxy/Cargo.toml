@@ -1,0 +1,16 @@
+[package]
+name = "writ-proxy"
+description = "stdio MCP interception for writ wrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+writ-policy.workspace = true
+writ-recorder.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

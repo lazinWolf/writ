@@ -1,0 +1,30 @@
+# Example policy for `writ wrap` (cooperative mode).
+#
+# This build enforces tool rules, argument conditions, and max_tool_calls.
+# Other writ.yaml fields from plan-v2.md §7.1 (data_flow, entitlements,
+# max_depth, ...) are rejected at load time until they are enforced.
+#
+# Precedence (D9): every matching rule is evaluated and the most restrictive
+# outcome wins (deny > require_sudo > allow). `tool: "*"` applies only to
+# tools no other rule matches. A tool no rule matches is denied.
+version: 1
+namespace: prod-customer-ops
+enforcement: cooperative
+
+limits:
+  max_tool_calls: 200
+
+capabilities:
+  - tool: "postgres.*"
+
+  - tool: "postgres.drop_*"
+    action: deny
+
+  - tool: "stripe.refund"
+    conditions:                  # all must hold; JSON literals on the right
+      - "args.amount <= 100.00"
+      - "args.currency == \"usd\""
+    on_violation: require_sudo   # no approval broker yet: the call is refused
+
+  - tool: "*"
+    action: deny                 # unknown tools denied
