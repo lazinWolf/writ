@@ -16,6 +16,7 @@ limits:
 
 capabilities:
   - tool: "postgres.*"
+    redact: ["args.params"]      # query parameters may carry customer data
 
   - tool: "postgres.drop_*"
     action: deny
@@ -25,6 +26,9 @@ capabilities:
       - "args.amount <= 100.00"
       - "args.currency == \"usd\""
     on_violation: require_sudo   # no approval broker yet: the call is refused
+
+  - tool: "vault.read"
+    record_arguments: false      # keep secret paths out of the flight log
 
   - tool: "*"
     action: deny                 # unknown tools denied

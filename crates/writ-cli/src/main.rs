@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -24,6 +25,12 @@ enum Commands {
         /// Flight recorder file [default: $WRIT_LOG or ~/.local/state/writ/flight.jsonl].
         #[arg(long)]
         log: Option<PathBuf>,
+        /// Wait for each decision to reach stable storage before forwarding the call.
+        #[arg(long)]
+        fsync: bool,
+        /// How long the server gets to exit after the client disconnects, before writ terminates it.
+        #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
+        shutdown_grace: Duration,
         /// The MCP server command and its arguments.
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<String>,
@@ -60,16 +67,27 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Commands::Wrap { policy, log, command } => {
-            let source = std::fs::read(&policy).with_context(|| format!("cannot read {}", policy.display()))?;
-            let parsed = Policy::from_path(&policy)?;
-            let recorder = Recorder::open(log.unwrap_or_else(writ_recorder::default_log_path))?;
+        Commands::Wrap {
+            policy,
+            log,
+            fsync,
+            shutdown_grace,
+            command,
+        } => {
+            // Read once: the recorded hash must describe exactly the policy being enforced.
+            let source =
+                std::fs::read_to_string(&policy).with_context(|| format!("cannot read {}", policy.display()))?;
+            let parsed = Policy::from_yaml_str(&source)?;
+            let mut recorder = Recorder::open(log.unwrap_or_else(writ_recorder::default_log_path))?;
+            recorder.set_fsync(fsync);
             let config = writ_proxy::WrapConfig {
                 policy: parsed,
-                policy_sha256: writ_recorder::sha256_hex(&source),
+                policy_sha256: writ_recorder::sha256_hex(source.as_bytes()),
                 recorder,
                 command,
                 session: writ_proxy::new_session_id(),
+                shutdown_grace,
+                forward_signals: true,
             };
             let code = writ_proxy::run(config, std::io::stdin(), std::io::stdout())?;
             Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))

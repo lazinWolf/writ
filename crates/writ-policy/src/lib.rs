@@ -11,6 +11,7 @@
 
 mod condition;
 mod glob;
+mod redact;
 
 use std::path::Path;
 
@@ -18,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use condition::Condition;
+pub use redact::MARKER as REDACTED;
+use redact::RedactPath;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -99,6 +102,21 @@ struct Rule {
     action: Action,
     conditions: Vec<Condition>,
     on_violation: Violation,
+    redact: Vec<RedactPath>,
+    record_arguments: bool,
+}
+
+/// How a call's arguments may appear in the flight recorder, merged across
+/// every rule that applies to the tool (most protective wins).
+struct Recording<'a> {
+    omit_all: bool,
+    redact: Vec<&'a RedactPath>,
+}
+
+impl Recording<'_> {
+    fn hides(&self, path: &[String]) -> bool {
+        self.omit_all || self.redact.iter().any(|r| r.covers(path))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +157,14 @@ struct RawRule {
     conditions: Vec<String>,
     #[serde(default)]
     on_violation: Violation,
+    #[serde(default)]
+    redact: Vec<String>,
+    #[serde(default = "default_true")]
+    record_arguments: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Policy {
@@ -200,11 +226,34 @@ impl Policy {
             };
         }
 
-        let mut decisions = candidates.into_iter().map(|rule| rule.decide(args));
+        let recording = Self::recording(&candidates);
+        let mut decisions = candidates.iter().map(|rule| rule.decide(args, &recording));
         let first = decisions.next().expect("candidates is non-empty");
         // `max_by_key` keeps the last maximum; fold keeps the first, so the
         // reported rule is the earliest of the most restrictive ones.
         decisions.fold(first, |best, d| if d.outcome > best.outcome { d } else { best })
+    }
+
+    /// The arguments as they may be written to the flight recorder: `None`
+    /// when any applicable rule sets `record_arguments: false`, otherwise a
+    /// copy with every applicable `redact` path replaced by a marker.
+    pub fn arguments_for_log(&self, tool: &str, args: &Value) -> Option<Value> {
+        let recording = Self::recording(&self.candidates(tool));
+        if recording.omit_all {
+            return None;
+        }
+        let mut args = args.clone();
+        for path in recording.redact {
+            path.apply(&mut args);
+        }
+        Some(args)
+    }
+
+    fn recording<'a>(candidates: &[&'a Rule]) -> Recording<'a> {
+        Recording {
+            omit_all: candidates.iter().any(|r| !r.record_arguments),
+            redact: candidates.iter().flat_map(|r| &r.redact).collect(),
+        }
     }
 
     /// True when the tool is denied whatever its arguments are. Used to hide
@@ -241,15 +290,22 @@ impl Rule {
             .iter()
             .map(|c| Condition::parse(c).map_err(|e| invalid(format!("rule `{}`: condition `{c}`: {e}", raw.tool))))
             .collect::<Result<_, _>>()?;
+        let redact = raw
+            .redact
+            .iter()
+            .map(|r| RedactPath::parse(r).map_err(|e| invalid(format!("rule `{}`: {e}", raw.tool))))
+            .collect::<Result<_, _>>()?;
         Ok(Rule {
             pattern: raw.tool,
             action: raw.action,
             conditions,
             on_violation: raw.on_violation,
+            redact,
+            record_arguments: raw.record_arguments,
         })
     }
 
-    fn decide(&self, args: &Value) -> Decision {
+    fn decide(&self, args: &Value, recording: &Recording) -> Decision {
         let rule = Some(self.pattern.clone());
         if self.action == Action::Deny {
             return Decision {
@@ -260,6 +316,12 @@ impl Rule {
         }
         for condition in &self.conditions {
             if let Err(reason) = condition.check(args) {
+                // Decision reasons are recorded, so they must not echo a redacted value.
+                let reason = if recording.hides(condition.path()) {
+                    format!("`{condition}` failed (value redacted)")
+                } else {
+                    reason
+                };
                 let outcome = match self.on_violation {
                     Violation::Deny => Outcome::Deny,
                     Violation::RequireSudo => Outcome::RequireSudo,
@@ -403,6 +465,56 @@ capabilities:
             let err = Policy::from_yaml_str(yaml).unwrap_err().to_string();
             assert!(err.contains(field) && err.contains("not enforced"), "{err}");
         }
+    }
+
+    const REDACTING: &str = r#"
+version: 1
+namespace: t
+capabilities:
+  - tool: "stripe.*"
+    redact: ["args.card"]
+  - tool: "stripe.charge"
+    conditions: ["args.card.number == \"4242\""]
+  - tool: "vault.read"
+    record_arguments: false
+    conditions: ["args.path == \"ok\""]
+  - tool: "*"
+    redact: ["args.*.password"]
+"#;
+
+    #[test]
+    fn redaction_merges_across_matching_rules() {
+        let p = Policy::from_yaml_str(REDACTING).unwrap();
+        let args = json!({"card": {"number": "1111"}, "amount": 5});
+        assert_eq!(
+            p.arguments_for_log("stripe.charge", &args),
+            Some(json!({"card": REDACTED, "amount": 5}))
+        );
+        assert_eq!(p.arguments_for_log("vault.read", &json!({"path": "x"})), None);
+        // The fallback applies only when no other rule matches.
+        assert_eq!(
+            p.arguments_for_log("db.login", &json!({"creds": {"password": "hunter2", "user": "a"}})),
+            Some(json!({"creds": {"password": REDACTED, "user": "a"}}))
+        );
+        assert_eq!(
+            p.arguments_for_log("stripe.list", &json!({"x": {"password": 1}})),
+            Some(json!({"x": {"password": 1}}))
+        );
+    }
+
+    #[test]
+    fn decision_reasons_do_not_echo_redacted_values() {
+        let p = Policy::from_yaml_str(REDACTING).unwrap();
+        let d = p.evaluate("stripe.charge", &json!({"card": {"number": "1111"}}));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(
+            !d.reason.contains("1111") && d.reason.contains("redacted"),
+            "{}",
+            d.reason
+        );
+
+        let d = p.evaluate("vault.read", &json!({"path": "/secret/prod"}));
+        assert!(!d.reason.contains("/secret/prod"), "{}", d.reason);
     }
 
     #[test]

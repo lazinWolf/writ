@@ -94,6 +94,10 @@ impl Condition {
         })
     }
 
+    pub(crate) fn path(&self) -> &[String] {
+        &self.path
+    }
+
     /// Returns `Err(reason)` when the condition does not hold.
     pub fn check(&self, args: &Value) -> Result<(), String> {
         let mut current = args;

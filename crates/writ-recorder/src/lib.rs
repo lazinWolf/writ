@@ -72,6 +72,7 @@ impl Entry {
 pub struct Recorder {
     path: PathBuf,
     file: File,
+    fsync: bool,
 }
 
 impl Recorder {
@@ -91,7 +92,21 @@ impl Recorder {
             .create(true)
             .open(&path)
             .map_err(io_err)?;
-        Ok(Recorder { path, file })
+        Ok(Recorder {
+            path,
+            file,
+            fsync: false,
+        })
+    }
+
+    /// When on, [`Recorder::append_durable`] waits for the entry to reach
+    /// stable storage (`fdatasync`) before returning. `fdatasync` also
+    /// persists every earlier entry in the file, so a machine crash can only
+    /// lose entries written after the last durable one. Off by default:
+    /// entries reach the OS but can be lost if the machine (not the process)
+    /// crashes.
+    pub fn set_fsync(&mut self, on: bool) {
+        self.fsync = on;
     }
 
     pub fn path(&self) -> &Path {
@@ -101,6 +116,17 @@ impl Recorder {
     /// Appends one entry and returns it. Fails if the existing chain head is
     /// unreadable, so a damaged log is never silently extended.
     pub fn append(&mut self, session: &str, kind: &str, data: Value) -> Result<Entry, RecorderError> {
+        self.append_inner(session, kind, data, false)
+    }
+
+    /// Like [`Recorder::append`], but also waits for stable storage when
+    /// fsync is on. Use it for entries that gate an action, such as a
+    /// decision recorded before a call is forwarded.
+    pub fn append_durable(&mut self, session: &str, kind: &str, data: Value) -> Result<Entry, RecorderError> {
+        self.append_inner(session, kind, data, true)
+    }
+
+    fn append_inner(&mut self, session: &str, kind: &str, data: Value, durable: bool) -> Result<Entry, RecorderError> {
         let path = self.path.clone();
         let io_err = |source| RecorderError::Io {
             path: path.clone(),
@@ -134,6 +160,9 @@ impl Recorder {
             line.push(b'\n');
             self.file.write_all(&line).map_err(io_err)?;
             self.file.flush().map_err(io_err)?;
+            if durable && self.fsync {
+                self.file.sync_data().map_err(io_err)?;
+            }
             Ok(entry)
         })();
         // Unlock even when the append failed; closing the file would also release it.
@@ -272,6 +301,18 @@ mod tests {
         assert_eq!(b.prev, a.hash);
         assert_eq!(b.seq, 1);
         assert_eq!(verify(&path).unwrap(), 2);
+    }
+
+    #[test]
+    fn durable_and_plain_appends_share_one_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flight.jsonl");
+        let mut rec = Recorder::open(&path).unwrap();
+        rec.set_fsync(true);
+        rec.append_durable("s", "tool_call", json!({})).unwrap();
+        rec.append("s", "tool_result", json!({})).unwrap();
+        rec.append_durable("s", "tool_call", json!({})).unwrap();
+        assert_eq!(verify(&path).unwrap(), 3);
     }
 
     #[test]

@@ -12,10 +12,19 @@
 //!   from the proxy (duplicate keys, lenient parsers).
 //! - Unparseable messages and JSON-RPC batches are rejected, not forwarded.
 //! - If the flight recorder cannot record a decision, the call is denied.
+//! - Arguments are redacted per policy before they are recorded.
+//! - Requests the server sends to the client (sampling, elicitation) are
+//!   recorded but not yet governed by policy.
+//!
+//! Unix only: the server runs in its own process group (see `supervisor`).
+
+mod supervisor;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,8 +34,7 @@ use serde_json::{Value, json};
 use writ_policy::{Outcome, Policy};
 use writ_recorder::Recorder;
 
-/// How long the server gets to exit after the client closes stdin.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+use supervisor::Event;
 
 pub struct WrapConfig {
     pub policy: Policy,
@@ -35,6 +43,12 @@ pub struct WrapConfig {
     /// Server program followed by its arguments.
     pub command: Vec<String>,
     pub session: String,
+    /// How long the server gets to exit after the client closes stdin (or
+    /// after it closes its own stdout) before writ terminates it.
+    pub shutdown_grace: Duration,
+    /// Forward SIGTERM, SIGINT, and SIGHUP received by this process to the
+    /// server. Installs process-wide signal handlers.
+    pub forward_signals: bool,
 }
 
 /// A session id that is unique enough to tell sessions apart in one log.
@@ -63,6 +77,12 @@ impl State {
         Ok(())
     }
 
+    /// For entries that gate an action: fsynced when the recorder asks for it.
+    fn record_durable(&mut self, kind: &str, data: Value) -> Result<()> {
+        self.recorder.append_durable(&self.session, kind, data)?;
+        Ok(())
+    }
+
     /// Recording failures on non-decision events are reported but not fatal.
     fn record_or_warn(&mut self, kind: &str, data: Value) {
         if let Err(e) = self.record(kind, data) {
@@ -73,8 +93,10 @@ impl State {
 
 type Shared<T> = Arc<Mutex<T>>;
 
-/// Runs the proxy until the server's stdout closes. Returns the server's exit
-/// code (or 1 if it was killed by a signal).
+/// Runs the proxy until the server has exited and its stdout has closed.
+/// Returns the exit code writ should exit with: the server's, `128 + n` if
+/// the server died from signal `n`, or `128 + n` if writ itself received
+/// signal `n`.
 pub fn run<R, W>(config: WrapConfig, client_in: R, client_out: W) -> Result<i32>
 where
     R: Read + Send + 'static,
@@ -86,8 +108,10 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("failed to start MCP server `{program}`"))?;
+    let pid = child.id();
     let server_in = child.stdin.take().expect("stdin is piped");
     let server_out = child.stdout.take().expect("stdout is piped");
 
@@ -99,45 +123,89 @@ where
         pending_calls: HashMap::new(),
         pending_lists: HashSet::new(),
     };
-    state.record(
+    if let Err(e) = state.record_durable(
         "session_start",
         json!({
             "command": config.command,
-            "server_pid": child.id(),
+            "server_pid": pid,
             "namespace": state.policy.namespace,
             "enforcement": state.policy.enforcement,
             "policy_sha256": config.policy_sha256,
         }),
-    )?;
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
 
     let state = Arc::new(Mutex::new(state));
     let client_out: Shared<W> = Arc::new(Mutex::new(client_out));
-    let child = Arc::new(Mutex::new(child));
+    let (events, inbox) = mpsc::channel();
 
+    if config.forward_signals {
+        forward_signals(events.clone())?;
+    }
     {
-        let (state, client_out, child) = (state.clone(), client_out.clone(), child.clone());
+        let (state, client_out, events) = (state.clone(), client_out.clone(), events.clone());
         thread::spawn(move || {
             client_to_server(client_in, server_in, &state, &client_out);
-            stop_server(&child);
+            let _ = events.send(Event::ClientClosed);
         });
     }
-
-    for line in BufReader::new(server_out).lines() {
-        let Ok(line) = line else { break };
-        let line = server_to_client(&line, &state);
-        if send(&client_out, &line).is_err() {
-            break;
-        }
+    {
+        let (state, client_out, events) = (state.clone(), client_out.clone(), events.clone());
+        thread::spawn(move || {
+            for line in BufReader::new(server_out).lines() {
+                let Ok(line) = line else { break };
+                let line = server_to_client(&line, &state);
+                if send(&client_out, &line).is_err() {
+                    // Nobody is listening any more; treat it like the client leaving.
+                    let _ = events.send(Event::ClientClosed);
+                    break;
+                }
+            }
+            let _ = events.send(Event::StdoutClosed);
+        });
     }
+    thread::spawn(move || {
+        if let Ok(status) = child.wait() {
+            let _ = events.send(Event::ServerExited(status));
+        }
+    });
 
-    let status = child.lock().unwrap().wait().context("waiting for MCP server")?;
-    let code = status.code().unwrap_or(1);
+    let outcome = supervisor::supervise(inbox, pid, config.shutdown_grace);
+
+    let code = match (outcome.writ_signal, outcome.status) {
+        (Some(sig), _) => 128 + sig,
+        (None, Some(status)) => status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        (None, None) => 1,
+    };
     let mut state = state.lock().unwrap();
-    let abandoned: Vec<&str> = state.pending_calls.values().map(|p| p.tool.as_str()).collect();
-    let data =
-        json!({ "exit_code": status.code(), "calls_allowed": state.calls_allowed, "unanswered_calls": abandoned });
+    let unanswered: Vec<&str> = state.pending_calls.values().map(|p| p.tool.as_str()).collect();
+    let data = json!({
+        "exit_code": outcome.status.and_then(|s| s.code()),
+        "server_signal": outcome.status.and_then(|s| s.signal()),
+        "termination": outcome.termination,
+        "writ_signal": outcome.writ_signal,
+        "calls_allowed": state.calls_allowed,
+        "unanswered_calls": unanswered,
+    });
     state.record_or_warn("session_end", data);
     Ok(code)
+}
+
+fn forward_signals(events: Sender<Event>) -> Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]).context("installing signal handlers")?;
+    thread::spawn(move || {
+        for signal in signals.forever() {
+            if events.send(Event::Signal(signal)).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(())
 }
 
 fn client_to_server<R: Read, W: Write>(
@@ -248,11 +316,12 @@ fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<(), Str
         decision.reason = format!("max_tool_calls limit reached ({max})");
     }
 
-    let recorded = state.record(
-        "tool_call",
-        json!({ "id": id, "tool": tool, "arguments": args, "decision": decision }),
-    );
-    if let Err(e) = recorded {
+    let mut data = json!({ "id": id, "tool": tool, "decision": decision });
+    match state.policy.arguments_for_log(&tool, &args) {
+        Some(logged) => data["arguments"] = logged,
+        None => data["arguments_omitted"] = json!(true),
+    }
+    if let Err(e) = state.record_durable("tool_call", data) {
         eprintln!("writ: {e:#}");
         return Err(tool_error(
             id,
@@ -288,10 +357,19 @@ fn server_to_client(line: &str, state: &Shared<State>) -> String {
     let Ok(mut message) = serde_json::from_str::<Value>(line) else {
         return line.to_string();
     };
-    // Only responses (no `method`) can answer a pending client request.
-    let Some(id) = message.get("id").filter(|_| message.get("method").is_none()) else {
-        return line.to_string();
+    let Some(id) = message.get("id") else {
+        return line.to_string(); // a notification
     };
+
+    if let Some(method) = message.get("method").and_then(Value::as_str) {
+        // A request from the server to the client, e.g. sampling/createMessage
+        // or elicitation/create. Params may carry prompts, so only the method
+        // is recorded.
+        let data = json!({ "id": id, "method": method });
+        state.lock().unwrap().record_or_warn("server_request", data);
+        return line.to_string();
+    }
+
     let key = id_key(id);
     let mut state = state.lock().unwrap();
 
@@ -328,19 +406,6 @@ fn server_to_client(line: &str, state: &Shared<State>) -> String {
         }
     }
     line.to_string()
-}
-
-fn stop_server(child: &Shared<Child>) {
-    let deadline = Instant::now() + SHUTDOWN_GRACE;
-    while Instant::now() < deadline {
-        match child.lock().unwrap().try_wait() {
-            Ok(None) => {}
-            _ => return,
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    eprintln!("writ: MCP server did not exit within {SHUTDOWN_GRACE:?} of stdin closing; killing it");
-    let _ = child.lock().unwrap().kill();
 }
 
 fn send<W: Write>(out: &Shared<W>, line: &str) -> std::io::Result<()> {

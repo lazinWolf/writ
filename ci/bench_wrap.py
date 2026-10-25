@@ -2,10 +2,11 @@
 
 Usage: bench_wrap.py <path-to-writ> [--calls N]
 
-Runs the same sequential tools/call workload three ways against the fake MCP
+Runs the same sequential tools/call workload four ways against the fake MCP
 server from the test suite:
   direct   client -> server
   allowed  client -> writ wrap -> server (decision recorded, call forwarded)
+  fsync    as allowed, with --fsync (each log entry reaches stable storage)
   denied   client -> writ wrap (decision recorded, answered by writ)
 Overhead is reported as the difference between allowed and direct percentiles.
 """
@@ -13,6 +14,7 @@ Overhead is reported as the difference between allowed and direct percentiles.
 import argparse
 import os
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +60,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("writ")
     parser.add_argument("--calls", type=int, default=5000)
+    parser.add_argument(
+        "--log-dir",
+        help="where flight logs go (default: a temp dir). fsync numbers are only meaningful on a "
+        "real filesystem: container overlays may be mounted `volatile`, which makes fsync a no-op",
+    )
     opts = parser.parse_args()
 
     work = tempfile.mkdtemp()
@@ -66,13 +73,21 @@ def main():
         f.write(POLICY)
     env = {**os.environ, "FAKE_MCP_LOG": os.devnull}
     server = [sys.executable, "-I", FIXTURE]
+    log_dir = opts.log_dir or work
+    os.makedirs(log_dir, exist_ok=True)
+    fs = subprocess.run(["stat", "-f", "-c", "%T", log_dir], capture_output=True, text=True).stdout.strip()
+    print(f"flight logs in {log_dir} ({fs or 'unknown filesystem'})")
 
-    def wrapped(log_name):
-        return [opts.writ, "wrap", "--policy", policy, "--log", os.path.join(work, log_name), "--", *server]
+    def wrapped(log_name, *flags):
+        log = os.path.join(log_dir, log_name)
+        if os.path.exists(log):
+            os.remove(log)
+        return [opts.writ, "wrap", *flags, "--policy", policy, "--log", log, "--", *server]
 
     runs = {
         "direct": measure(server, env, "postgres.query", opts.calls),
         "allowed": measure(wrapped("allowed.jsonl"), env, "postgres.query", opts.calls),
+        "fsync": measure(wrapped("fsync.jsonl", "--fsync"), env, "postgres.query", opts.calls),
         "denied": measure(wrapped("denied.jsonl"), env, "shell.exec", opts.calls),
     }
 
@@ -81,9 +96,10 @@ def main():
     for name, samples in runs.items():
         row = [percentile(samples, p) for p in (50, 90, 99)] + [max(samples), statistics.fmean(samples)]
         print(f"{name:10}" + "".join(f"{v:9.0f}" for v in row))
-    for p in (50, 99):
-        overhead = percentile(runs["allowed"], p) - percentile(runs["direct"], p)
-        print(f"writ overhead at p{p}: {overhead:.0f} us")
+    for variant in ("allowed", "fsync"):
+        for p in (50, 99):
+            overhead = percentile(runs[variant], p) - percentile(runs["direct"], p)
+            print(f"writ overhead ({variant}) at p{p}: {overhead:.0f} us")
 
 
 if __name__ == "__main__":

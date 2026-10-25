@@ -247,7 +247,7 @@ The "kernel" framing is earned at mediated mode and fully true at isolated mode.
 ### In-scope adversaries
 1. **Injected content:** untrusted emails, tickets, webpages, documents, or agent messages that try to steer an agent (prompt injection).
 2. **Faulty agents:** hallucinated arguments, misread logs, runaway loops, accidental destructive calls.
-3. **Malicious or compromised MCP servers:** returning manipulated results, smuggling instructions, exfiltrating data passed to them, or replaying any token they observe (mitigated by writd stripping writs before forwarding, §4.1).
+3. **Malicious or compromised MCP servers:** returning manipulated results, smuggling instructions, exfiltrating data passed to them, or replaying any token they observe (mitigated by writd stripping writs before forwarding, §4.1). They can also send requests to the client (MCP sampling and elicitation) that reach the model or the user directly, outside any `tools/call`. `writ wrap` records these, but policy over them is an open question (§18).
 4. **Compromised sub-agents:** a sub-agent whose behavior has been subverted and that tries to escalate via other agents (confused deputy).
 5. **Credential theft from agent environments:** e.g., `printenv` in a coding agent.
 6. **Storage-mediated injection:** attacker-shaped content written to a shared store by one branch and read later by a branch with a clean root (§4.2, persistence laundering).
@@ -651,6 +651,7 @@ Security buyers read overclaiming as a sign the team doesn't understand security
 9. Entitlement sources: which resolver ships in V1 (Stripe customer ownership, CRM account ownership, or IdP groups), and how is a stale or wrong entitlement answer handled?
 10. Label persistence: in V2, where do integrity labels on agent writes live (label column, side table, or row metadata), and how do they survive ETL and replication?
 11. Verify the §11.2 market figures and acquisition dates, and add sources.
+12. Server-initiated requests: should policy govern MCP sampling and elicitation requests (allow, deny, or require approval per server), and do they taint the branch that triggered them?
 
 ---
 
