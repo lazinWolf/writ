@@ -29,9 +29,7 @@ enum Commands {
         command: Vec<String>,
     },
     /// Validate a writ.yaml without running anything.
-    Check {
-        policy: PathBuf,
-    },
+    Check { policy: PathBuf },
     /// Show or verify the flight recorder.
     Log {
         /// Flight recorder file [default: $WRIT_LOG or ~/.local/state/writ/flight.jsonl].
@@ -83,11 +81,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 policy.display(),
                 parsed.namespace,
                 parsed.enforcement,
-                parsed.limits.max_tool_calls.map_or("unlimited".to_string(), |n| n.to_string()),
+                parsed
+                    .limits
+                    .max_tool_calls
+                    .map_or("unlimited".to_string(), |n| n.to_string()),
             );
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Log { log, verify, session, json } => {
+        Commands::Log {
+            log,
+            verify,
+            session,
+            json,
+        } => {
             let path = log.unwrap_or_else(writ_recorder::default_log_path);
             if verify {
                 let count = writ_recorder::verify(&path)?;
@@ -96,7 +102,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             let entries = writ_recorder::read_entries(&path)?;
-            for entry in entries.iter().filter(|e| session.as_ref().is_none_or(|s| &e.session == s)) {
+            for entry in entries
+                .iter()
+                .filter(|e| session.as_ref().is_none_or(|s| &e.session == s))
+            {
                 if json {
                     println!("{}", serde_json::to_string(entry)?);
                 } else {
@@ -114,7 +123,10 @@ fn format_entry(entry: &Entry) -> String {
     let summary = match entry.kind.as_str() {
         "session_start" => format!(
             "{} (policy {} sha256:{:.12})",
-            d["command"].as_array().map(|c| c.iter().map(s).collect::<Vec<_>>().join(" ")).unwrap_or_default(),
+            d["command"]
+                .as_array()
+                .map(|c| c.iter().map(s).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
             s(&d["namespace"]),
             s(&d["policy_sha256"]),
         ),
@@ -127,10 +139,17 @@ fn format_entry(entry: &Entry) -> String {
         "tool_result" => format!(
             "{} {} in {}ms",
             s(&d["tool"]),
-            if d["is_error"].as_bool() == Some(true) { "errored" } else { "ok" },
+            if d["is_error"].as_bool() == Some(true) {
+                "errored"
+            } else {
+                "ok"
+            },
             d["duration_ms"],
         ),
         _ => d.to_string(),
     };
-    format!("{:>5}  {}  {}  {:<13}  {}", entry.seq, entry.ts, entry.session, entry.kind, summary)
+    format!(
+        "{:>5}  {}  {}  {:<13}  {}",
+        entry.seq, entry.ts, entry.session, entry.kind, summary
+    )
 }

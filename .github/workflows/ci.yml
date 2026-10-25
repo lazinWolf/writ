@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fmt, clippy, tests (in the dev container)
+        run: CONTAINER_ENGINE=docker ci/container.sh ci/check.sh
+
+  real-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: writ wrap against the MCP reference server (in the dev container)
+        run: CONTAINER_ENGINE=docker ci/container.sh ci/real-server-check.sh

@@ -78,11 +78,19 @@ impl Recorder {
     /// Opens (creating if needed) the log at `path`, and its parent directory.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, RecorderError> {
         let path = path.into();
-        let io_err = |source| RecorderError::Io { path: path.clone(), source };
+        let io_err = |source| RecorderError::Io {
+            path: path.clone(),
+            source,
+        };
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(io_err)?;
         }
-        let file = OpenOptions::new().read(true).append(true).create(true).open(&path).map_err(io_err)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map_err(io_err)?;
         Ok(Recorder { path, file })
     }
 
@@ -94,7 +102,10 @@ impl Recorder {
     /// unreadable, so a damaged log is never silently extended.
     pub fn append(&mut self, session: &str, kind: &str, data: Value) -> Result<Entry, RecorderError> {
         let path = self.path.clone();
-        let io_err = |source| RecorderError::Io { path: path.clone(), source };
+        let io_err = |source| RecorderError::Io {
+            path: path.clone(),
+            source,
+        };
 
         self.file.lock().map_err(io_err)?;
         let result = (|| {
@@ -134,10 +145,16 @@ impl Recorder {
 /// Reads every entry without checking the chain.
 pub fn read_entries(path: impl AsRef<Path>) -> Result<Vec<Entry>, RecorderError> {
     let path = path.as_ref();
-    let file = File::open(path).map_err(|source| RecorderError::Io { path: path.to_path_buf(), source })?;
+    let file = File::open(path).map_err(|source| RecorderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mut entries = Vec::new();
     for (i, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|source| RecorderError::Io { path: path.to_path_buf(), source })?;
+        let line = line.map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let entry = serde_json::from_str(&line).map_err(|e| RecorderError::Corrupt {
             path: path.to_path_buf(),
             line: i as u64 + 1,
@@ -152,7 +169,11 @@ pub fn read_entries(path: impl AsRef<Path>) -> Result<Vec<Entry>, RecorderError>
 /// Returns the number of entries verified.
 pub fn verify(path: impl AsRef<Path>) -> Result<u64, RecorderError> {
     let path = path.as_ref();
-    let corrupt = |line: u64, reason: String| RecorderError::Corrupt { path: path.to_path_buf(), line, reason };
+    let corrupt = |line: u64, reason: String| RecorderError::Corrupt {
+        path: path.to_path_buf(),
+        line,
+        reason,
+    };
 
     let mut prev = GENESIS_HASH.to_string();
     let entries = read_entries(path)?;
@@ -162,7 +183,10 @@ pub fn verify(path: impl AsRef<Path>) -> Result<u64, RecorderError> {
             return Err(corrupt(line, format!("expected seq {i}, found {}", entry.seq)));
         }
         if entry.prev != prev {
-            return Err(corrupt(line, "prev does not match the previous entry's hash".to_string()));
+            return Err(corrupt(
+                line,
+                "prev does not match the previous entry's hash".to_string(),
+            ));
         }
         if entry.compute_hash() != entry.hash {
             return Err(corrupt(line, "hash does not match entry contents".to_string()));
@@ -299,7 +323,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flight.jsonl");
         let mut rec = Recorder::open(&path).unwrap();
-        rec.append("s", "tool_call", json!({"tool": "stripe.refund", "amount": 240})).unwrap();
+        rec.append("s", "tool_call", json!({"tool": "stripe.refund", "amount": 240}))
+            .unwrap();
         rec.append("s", "tool_call", json!({"tool": "other"})).unwrap();
 
         let original = std::fs::read_to_string(&path).unwrap();

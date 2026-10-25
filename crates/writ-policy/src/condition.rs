@@ -49,8 +49,7 @@ impl Condition {
     pub fn parse(source: &str) -> Result<Self, String> {
         let s = source.trim();
         let rest = s.strip_prefix("args.").ok_or_else(|| {
-            "conditions must start with `args.` (writ.* and other context fields are not supported yet)"
-                .to_string()
+            "conditions must start with `args.` (writ.* and other context fields are not supported yet)".to_string()
         })?;
 
         let path_end = rest
@@ -75,7 +74,10 @@ impl Condition {
         .ok_or_else(|| "expected one of <, <=, >, >=, ==, != after the argument path".to_string())?;
 
         let literal: Value = serde_json::from_str(rest.trim()).map_err(|_| {
-            format!("right-hand side `{}` is not a JSON literal (use \"quoted\" strings)", rest.trim())
+            format!(
+                "right-hand side `{}` is not a JSON literal (use \"quoted\" strings)",
+                rest.trim()
+            )
         })?;
         if literal.is_array() || literal.is_object() {
             return Err("right-hand side must be a number, string, boolean, or null".to_string());
@@ -84,7 +86,12 @@ impl Condition {
             return Err(format!("`{}` needs a numeric right-hand side", op.symbol()));
         }
 
-        Ok(Condition { path, op, literal, source: s.to_string() })
+        Ok(Condition {
+            path,
+            op,
+            literal,
+            source: s.to_string(),
+        })
     }
 
     /// Returns `Err(reason)` when the condition does not hold.

@@ -134,7 +134,8 @@ where
     let code = status.code().unwrap_or(1);
     let mut state = state.lock().unwrap();
     let abandoned: Vec<&str> = state.pending_calls.values().map(|p| p.tool.as_str()).collect();
-    let data = json!({ "exit_code": status.code(), "calls_allowed": state.calls_allowed, "unanswered_calls": abandoned });
+    let data =
+        json!({ "exit_code": status.code(), "calls_allowed": state.calls_allowed, "unanswered_calls": abandoned });
     state.record_or_warn("session_end", data);
     Ok(code)
 }
@@ -152,14 +153,26 @@ fn client_to_server<R: Read, W: Write>(
         }
         let forward = match serde_json::from_str::<Value>(&line) {
             Err(e) => {
-                state.lock().unwrap().record_or_warn("protocol_error", json!({ "error": e.to_string() }));
-                let _ = send(client_out, &rpc_error(&Value::Null, -32700, "writ: message is not valid JSON"));
+                state
+                    .lock()
+                    .unwrap()
+                    .record_or_warn("protocol_error", json!({ "error": e.to_string() }));
+                let _ = send(
+                    client_out,
+                    &rpc_error(&Value::Null, -32700, "writ: message is not valid JSON"),
+                );
                 None
             }
             Ok(Value::Array(batch)) => {
-                state.lock().unwrap().record_or_warn("protocol_error", json!({ "error": "batch rejected" }));
+                state
+                    .lock()
+                    .unwrap()
+                    .record_or_warn("protocol_error", json!({ "error": "batch rejected" }));
                 for id in batch.iter().filter_map(|m| m.get("id")) {
-                    let _ = send(client_out, &rpc_error(id, -32600, "writ: JSON-RPC batches are not supported"));
+                    let _ = send(
+                        client_out,
+                        &rpc_error(id, -32600, "writ: JSON-RPC batches are not supported"),
+                    );
                 }
                 None
             }
@@ -195,7 +208,10 @@ fn handle_client_message<W: Write>(message: Value, state: &Shared<State>, client
         }
         (Some("tools/call"), None) => {
             // A notification cannot carry a result, so there is nothing to allow.
-            state.lock().unwrap().record_or_warn("protocol_error", json!({ "error": "tools/call without id dropped" }));
+            state
+                .lock()
+                .unwrap()
+                .record_or_warn("protocol_error", json!({ "error": "tools/call without id dropped" }));
             None
         }
         (Some("tools/list"), Some(id)) => {
@@ -210,8 +226,15 @@ fn handle_client_message<W: Write>(message: Value, state: &Shared<State>, client
 /// proxy sends instead.
 fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<(), String> {
     let params = message.get("params");
-    let Some(tool) = params.and_then(|p| p.get("name")).and_then(Value::as_str).map(str::to_string) else {
-        state.record_or_warn("protocol_error", json!({ "error": "tools/call without a string name", "id": id }));
+    let Some(tool) = params
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        state.record_or_warn(
+            "protocol_error",
+            json!({ "error": "tools/call without a string name", "id": id }),
+        );
         return Err(rpc_error(id, -32602, "writ: tools/call requires a string `name`"));
     };
     let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
@@ -231,13 +254,22 @@ fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<(), Str
     );
     if let Err(e) = recorded {
         eprintln!("writ: {e:#}");
-        return Err(tool_error(id, "writ denied this call: the flight recorder is unavailable, so the call cannot be audited"));
+        return Err(tool_error(
+            id,
+            "writ denied this call: the flight recorder is unavailable, so the call cannot be audited",
+        ));
     }
 
     match decision.outcome {
         Outcome::Allow => {
             state.calls_allowed += 1;
-            state.pending_calls.insert(id_key(id), PendingCall { tool, started: Instant::now() });
+            state.pending_calls.insert(
+                id_key(id),
+                PendingCall {
+                    tool,
+                    started: Instant::now(),
+                },
+            );
             Ok(())
         }
         Outcome::RequireSudo => Err(tool_error(
@@ -265,7 +297,10 @@ fn server_to_client(line: &str, state: &Shared<State>) -> String {
 
     if let Some(call) = state.pending_calls.remove(&key) {
         let is_error = message.get("error").is_some()
-            || message.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(false);
+            || message
+                .pointer("/result/isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let data = json!({
             "id": id,
             "tool": call.tool,

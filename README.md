@@ -56,3 +56,26 @@ The log path defaults to `$WRIT_LOG`, then `$XDG_STATE_HOME/writ/flight.jsonl`, 
 | `writ-cli` | The `writ` binary: `wrap`, `check`, `log` |
 
 `cargo test --workspace` runs unit tests and an end-to-end suite against a fake MCP server (`crates/writ-cli/tests/fixtures/fake_mcp_server.py`; needs `python3`).
+
+## Checks
+
+Everything runs in a Fedora 43 dev container (`ci/Containerfile`). The source is copied into the image rather than bind-mounted, so code run by checks can't touch the host checkout. Set `CONTAINER_ENGINE=docker` to use Docker instead of Podman.
+
+```sh
+ci/container.sh ci/check.sh              # rustfmt, clippy -D warnings, tests
+ci/container.sh ci/real-server-check.sh  # wrap @modelcontextprotocol/server-everything from npm
+ci/container.sh ci/bench.sh              # per-call latency overhead
+```
+
+`real-server-check` downloads and runs a third-party npm package. Run it only in the container.
+
+### Latency (Oct 2026, release build, in the container)
+
+Overhead is the latency added to each sequential `tools/call` round trip by evaluating the policy, appending to the flight log, and forwarding. Three runs of 5,000 calls each:
+
+| | p50 | p99 |
+|---|---|---|
+| Added by `writ wrap` (allowed call) | ~67 µs | 90–107 µs |
+| Denied call, answered by writ (total) | ~44 µs | ~106 µs |
+
+This is well inside the Phase 0 target (low single-digit milliseconds at p99). Caveats: log appends are not fsynced, the fake server is trivial, and the log was on the container's overlay filesystem. Rerun `ci/bench.sh` after any change to the recorder or proxy.

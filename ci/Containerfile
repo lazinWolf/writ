@@ -1,0 +1,21 @@
+# Dev/CI image for writ. Source is copied in rather than bind-mounted, so code
+# that checks run (including third-party MCP servers fetched from npm) cannot
+# reach the host checkout. Build caches live in named volumes; see container.sh.
+FROM registry.fedoraproject.org/fedora:43
+
+# Node 24: current MCP reference servers require it. Fedora's nodejs24 ships
+# only versioned binaries (node-24, npx-24), so link the unversioned names.
+RUN dnf -y install --setopt=install_weak_deps=False \
+        gcc rust cargo clippy rustfmt python3 nodejs24 nodejs24-npm \
+    && dnf clean all \
+    && for bin in node npm npx; do ln -s "/usr/bin/$bin-24" "/usr/local/bin/$bin"; done
+
+RUN useradd --create-home writ \
+    && mkdir /src /target /cargo \
+    && chown writ:writ /src /target /cargo
+USER writ
+ENV CARGO_HOME=/cargo \
+    CARGO_TARGET_DIR=/target \
+    npm_config_update_notifier=false
+WORKDIR /src
+COPY --chown=writ:writ . /src

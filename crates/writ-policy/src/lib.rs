@@ -144,8 +144,10 @@ struct RawRule {
 impl Policy {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, PolicyError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .map_err(|source| PolicyError::Io { path: path.display().to_string(), source })?;
+        let text = std::fs::read_to_string(path).map_err(|source| PolicyError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
         Self::from_yaml_str(&text)
     }
 
@@ -179,7 +181,9 @@ impl Policy {
         Ok(Policy {
             namespace: raw.namespace,
             enforcement: raw.enforcement,
-            limits: Limits { max_tool_calls: raw.limits.max_tool_calls },
+            limits: Limits {
+                max_tool_calls: raw.limits.max_tool_calls,
+            },
             rules,
             fallback,
         })
@@ -213,7 +217,11 @@ impl Policy {
 
     fn candidates(&self, tool: &str) -> Vec<&Rule> {
         let matching: Vec<&Rule> = self.rules.iter().filter(|r| glob::matches(&r.pattern, tool)).collect();
-        if matching.is_empty() { self.fallback.iter().collect() } else { matching }
+        if matching.is_empty() {
+            self.fallback.iter().collect()
+        } else {
+            matching
+        }
     }
 }
 
@@ -233,13 +241,22 @@ impl Rule {
             .iter()
             .map(|c| Condition::parse(c).map_err(|e| invalid(format!("rule `{}`: condition `{c}`: {e}", raw.tool))))
             .collect::<Result<_, _>>()?;
-        Ok(Rule { pattern: raw.tool, action: raw.action, conditions, on_violation: raw.on_violation })
+        Ok(Rule {
+            pattern: raw.tool,
+            action: raw.action,
+            conditions,
+            on_violation: raw.on_violation,
+        })
     }
 
     fn decide(&self, args: &Value) -> Decision {
         let rule = Some(self.pattern.clone());
         if self.action == Action::Deny {
-            return Decision { outcome: Outcome::Deny, rule, reason: format!("denied by rule `{}`", self.pattern) };
+            return Decision {
+                outcome: Outcome::Deny,
+                rule,
+                reason: format!("denied by rule `{}`", self.pattern),
+            };
         }
         for condition in &self.conditions {
             if let Err(reason) = condition.check(args) {
@@ -250,7 +267,11 @@ impl Rule {
                 return Decision { outcome, rule, reason };
             }
         }
-        Decision { outcome: Outcome::Allow, rule, reason: format!("allowed by rule `{}`", self.pattern) }
+        Decision {
+            outcome: Outcome::Allow,
+            rule,
+            reason: format!("allowed by rule `{}`", self.pattern),
+        }
     }
 }
 
@@ -334,7 +355,10 @@ capabilities:
     #[test]
     fn fallback_applies_only_when_nothing_else_matches() {
         assert_eq!(policy().evaluate("shell.exec", &json!({})).outcome, Outcome::Deny);
-        assert_eq!(policy().evaluate("stripe.refund", &json!({"amount": 5})).outcome, Outcome::Allow);
+        assert_eq!(
+            policy().evaluate("stripe.refund", &json!({"amount": 5})).outcome,
+            Outcome::Allow
+        );
     }
 
     #[test]
@@ -366,8 +390,14 @@ capabilities:
     fn rejects_unimplemented_fields() {
         let cases = [
             ("version: 1\nnamespace: t\ndata_flow: {}\n", "data_flow"),
-            ("version: 1\nnamespace: t\nlimits:\n  max_depth: 4\n", "limits.max_depth"),
-            ("version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    privileged: true\n", "privileged"),
+            (
+                "version: 1\nnamespace: t\nlimits:\n  max_depth: 4\n",
+                "limits.max_depth",
+            ),
+            (
+                "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    privileged: true\n",
+                "privileged",
+            ),
         ];
         for (yaml, field) in cases {
             let err = Policy::from_yaml_str(yaml).unwrap_err().to_string();

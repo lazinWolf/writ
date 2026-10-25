@@ -32,7 +32,12 @@ struct Run {
 }
 
 fn python() -> Option<&'static str> {
-    Command::new("python3").arg("--version").output().ok().filter(|o| o.status.success()).map(|_| "python3")
+    Command::new("python3")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|_| "python3")
 }
 
 fn fixture() -> PathBuf {
@@ -124,13 +129,21 @@ fn enforces_policy_end_to_end() {
 
     assert_eq!(r["1"]["result"]["serverInfo"]["name"], "fake");
 
-    let listed: Vec<&str> =
-        r["2"]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let listed: Vec<&str> = r["2"]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert_eq!(listed, ["postgres.query", "stripe.refund"]);
 
     assert!(!is_tool_error(&r["3"]) && text(&r["3"]).starts_with("executed postgres.query"));
 
-    assert!(is_tool_error(&r["4"]) && text(&r["4"]).contains("requires approval"), "{}", r["4"]);
+    assert!(
+        is_tool_error(&r["4"]) && text(&r["4"]).contains("requires approval"),
+        "{}",
+        r["4"]
+    );
     assert!(text(&r["4"]).contains("args.amount = 240"));
 
     assert!(is_tool_error(&r["5"]) && text(&r["5"]).contains("denied"));
@@ -141,15 +154,29 @@ fn enforces_policy_end_to_end() {
     // Denied calls never reached the server.
     assert!(run.server_saw.contains("select 1"));
     for absent in ["printenv", "invoices", "240", "select 2"] {
-        assert!(!run.server_saw.contains(absent), "server saw {absent}: {}", run.server_saw);
+        assert!(
+            !run.server_saw.contains(absent),
+            "server saw {absent}: {}",
+            run.server_saw
+        );
     }
 
     // The flight recorder has a verifiable chain with one decision per call.
-    assert_eq!(writ_recorder_verify(&run.log), 11, "{}", std::fs::read_to_string(&run.log).unwrap());
+    assert_eq!(
+        writ_recorder_verify(&run.log),
+        11,
+        "{}",
+        std::fs::read_to_string(&run.log).unwrap()
+    );
     let log = std::fs::read_to_string(&run.log).unwrap();
     let kinds: Vec<String> = log
         .lines()
-        .map(|l| serde_json::from_str::<Value>(l).unwrap()["kind"].as_str().unwrap().to_string())
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
     assert_eq!(kinds.first().map(String::as_str), Some("session_start"));
     assert_eq!(kinds.last().map(String::as_str), Some("session_end"));
@@ -199,20 +226,41 @@ fn check_rejects_unenforced_fields() {
     let dir = tempfile::tempdir().unwrap();
     let policy = dir.path().join("writ.yaml");
     std::fs::write(&policy, "version: 1\nnamespace: t\nlimits:\n  max_budget_usd: 1.5\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_writ")).arg("check").arg(&policy).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .arg("check")
+        .arg(&policy)
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("limits.max_budget_usd") && stderr.contains("not enforced"), "{stderr}");
+    assert!(
+        stderr.contains("limits.max_budget_usd") && stderr.contains("not enforced"),
+        "{stderr}"
+    );
 
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/writ.yaml");
-    let out = Command::new(env!("CARGO_BIN_EXE_writ")).arg("check").arg(example).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .arg("check")
+        .arg(example)
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// Runs `writ log --verify` and returns the verified entry count.
 fn writ_recorder_verify(log: &Path) -> u64 {
-    let out = Command::new(env!("CARGO_BIN_EXE_writ")).args(["log", "--verify", "--log"]).arg(log).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["log", "--verify", "--log"])
+        .arg(log)
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8(out.stdout).unwrap();
-    stdout.split(": ").nth(1).and_then(|s| s.split_whitespace().next()).unwrap().parse().unwrap()
+    stdout
+        .split(": ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap()
+        .parse()
+        .unwrap()
 }
