@@ -13,11 +13,14 @@
 //! - Unparseable messages and JSON-RPC batches are rejected, not forwarded.
 //! - If the flight recorder cannot record a decision, the call is denied.
 //! - Arguments are redacted per policy before they are recorded.
+//! - Policy evaluation, limits, and recording live in a [`Backend`]: the
+//!   in-process engine (standalone) or writd (shared task).
 //! - Requests the server sends to the client (sampling, elicitation) are
 //!   recorded but not yet governed by policy.
 //!
 //! Unix only: the server runs in its own process group (see `supervisor`).
 
+mod backend;
 mod supervisor;
 
 use std::collections::{HashMap, HashSet};
@@ -27,22 +30,19 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use writ_policy::{Outcome, Policy};
-use writ_recorder::Recorder;
+use writ_policy::Outcome;
 
+pub use backend::{Backend, DaemonBackend, LocalBackend};
 use supervisor::Event;
 
 pub struct WrapConfig {
-    pub policy: Policy,
-    pub policy_sha256: String,
-    pub recorder: Recorder,
+    pub backend: Box<dyn Backend>,
     /// Server program followed by its arguments.
     pub command: Vec<String>,
-    pub session: String,
     /// How long the server gets to exit after the client closes stdin (or
     /// after it closes its own stdout) before writ terminates it.
     pub shutdown_grace: Duration,
@@ -51,41 +51,21 @@ pub struct WrapConfig {
     pub forward_signals: bool,
 }
 
-/// A session id that is unique enough to tell sessions apart in one log.
-pub fn new_session_id() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    format!("ses_{nanos:x}{:x}", std::process::id())
-}
-
 struct PendingCall {
     tool: String,
     started: Instant,
 }
 
 struct State {
-    policy: Policy,
-    recorder: Recorder,
-    session: String,
-    calls_allowed: u64,
+    backend: Box<dyn Backend>,
     pending_calls: HashMap<String, PendingCall>,
     pending_lists: HashSet<String>,
 }
 
 impl State {
-    fn record(&mut self, kind: &str, data: Value) -> Result<()> {
-        self.recorder.append(&self.session, kind, data)?;
-        Ok(())
-    }
-
-    /// For entries that gate an action: fsynced when the recorder asks for it.
-    fn record_durable(&mut self, kind: &str, data: Value) -> Result<()> {
-        self.recorder.append_durable(&self.session, kind, data)?;
-        Ok(())
-    }
-
     /// Recording failures on non-decision events are reported but not fatal.
     fn record_or_warn(&mut self, kind: &str, data: Value) {
-        if let Err(e) = self.record(kind, data) {
+        if let Err(e) = self.backend.record(kind, data) {
             eprintln!("writ: {e:#}");
         }
     }
@@ -116,23 +96,14 @@ where
     let server_out = child.stdout.take().expect("stdout is piped");
 
     let mut state = State {
-        policy: config.policy,
-        recorder: config.recorder,
-        session: config.session,
-        calls_allowed: 0,
+        backend: config.backend,
         pending_calls: HashMap::new(),
         pending_lists: HashSet::new(),
     };
-    if let Err(e) = state.record_durable(
-        "session_start",
-        json!({
-            "command": config.command,
-            "server_pid": pid,
-            "namespace": state.policy.namespace,
-            "enforcement": state.policy.enforcement,
-            "policy_sha256": config.policy_sha256,
-        }),
-    ) {
+    if let Err(e) = state
+        .backend
+        .open(json!({ "command": config.command, "server_pid": pid }))
+    {
         let _ = child.kill();
         let _ = child.wait();
         return Err(e);
@@ -187,10 +158,11 @@ where
         "server_signal": outcome.status.and_then(|s| s.signal()),
         "termination": outcome.termination,
         "writ_signal": outcome.writ_signal,
-        "calls_allowed": state.calls_allowed,
         "unanswered_calls": unanswered,
     });
-    state.record_or_warn("session_end", data);
+    if let Err(e) = state.backend.close(data) {
+        eprintln!("writ: {e:#}");
+    }
     Ok(code)
 }
 
@@ -307,31 +279,20 @@ fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<(), Str
     };
     let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
 
-    let mut decision = state.policy.evaluate(&tool, &args);
-    if decision.outcome == Outcome::Allow
-        && let Some(max) = state.policy.limits.max_tool_calls
-        && state.calls_allowed >= max
-    {
-        decision.outcome = Outcome::Deny;
-        decision.reason = format!("max_tool_calls limit reached ({max})");
-    }
-
-    let mut data = json!({ "id": id, "tool": tool, "decision": decision });
-    match state.policy.arguments_for_log(&tool, &args) {
-        Some(logged) => data["arguments"] = logged,
-        None => data["arguments_omitted"] = json!(true),
-    }
-    if let Err(e) = state.record_durable("tool_call", data) {
-        eprintln!("writ: {e:#}");
-        return Err(tool_error(
-            id,
-            "writ denied this call: the flight recorder is unavailable, so the call cannot be audited",
-        ));
-    }
+    // The backend records the decision before returning it; if it cannot, deny.
+    let decision = match state.backend.decide(id, &tool, &args) {
+        Ok(decision) => decision,
+        Err(e) => {
+            eprintln!("writ: {e:#}");
+            return Err(tool_error(
+                id,
+                "writ denied this call: the decision could not be made and recorded (writd or the flight recorder is unavailable)",
+            ));
+        }
+    };
 
     match decision.outcome {
         Outcome::Allow => {
-            state.calls_allowed += 1;
             state.pending_calls.insert(
                 id_key(id),
                 PendingCall {
@@ -392,13 +353,19 @@ fn server_to_client(line: &str, state: &Shared<State>) -> String {
     if state.pending_lists.remove(&key)
         && let Some(Value::Array(tools)) = message.pointer_mut("/result/tools")
     {
-        let mut hidden = Vec::new();
-        tools.retain(|tool| match tool.get("name").and_then(Value::as_str) {
-            Some(name) if state.policy.always_denies(name) => {
-                hidden.push(name.to_string());
-                false
-            }
-            _ => true,
+        let names: Vec<String> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        // Hiding is a usability aid (D6): on failure, show the list and rely on per-call denial.
+        let hidden = state.backend.hidden_tools(&names).unwrap_or_else(|e| {
+            eprintln!("writ: {e:#}");
+            Vec::new()
+        });
+        tools.retain(|t| {
+            t.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !hidden.iter().any(|h| h == name))
         });
         if !hidden.is_empty() {
             state.record_or_warn("tools_hidden", json!({ "tools": hidden }));

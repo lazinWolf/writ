@@ -498,10 +498,28 @@ dependencies = [
  "anyhow",
  "clap",
  "humantime",
+ "libc",
  "serde_json",
+ "signal-hook",
  "tempfile",
+ "writ-daemon",
  "writ-policy",
  "writ-proxy",
+ "writ-recorder",
+]
+
+[[package]]
+name = "writ-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
+ "writ-policy",
  "writ-recorder",
 ]
 
@@ -524,6 +542,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tempfile",
+ "writ-daemon",
  "writ-policy",
  "writ-recorder",
 ]

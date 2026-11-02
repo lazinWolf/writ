@@ -2,17 +2,20 @@
 
 Usage: bench_wrap.py <path-to-writ> [--calls N]
 
-Runs the same sequential tools/call workload four ways against the fake MCP
+Runs the same sequential tools/call workload six ways against the fake MCP
 server from the test suite:
-  direct   client -> server
-  allowed  client -> writ wrap -> server (decision recorded, call forwarded)
-  fsync    as allowed, with --fsync (each log entry reaches stable storage)
-  denied   client -> writ wrap (decision recorded, answered by writ)
-Overhead is reported as the difference between allowed and direct percentiles.
+  direct    client -> server
+  standalone client -> writ wrap -> server (decision fsynced, the default)
+  nofsync   as standalone, with --no-fsync
+  daemon    client -> writ wrap -> writd -> back -> server (writd fsyncs)
+  daemon-nofsync  as daemon, writd started with --no-fsync (isolates the socket hop)
+  denied    client -> writ wrap (decision recorded, answered by writ)
+Overhead is the difference from direct at each percentile.
 """
 
 import argparse
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -84,19 +87,39 @@ def main():
             os.remove(log)
         return [opts.writ, "wrap", *flags, "--policy", policy, "--log", log, "--", *server]
 
+    writd_bin = os.path.join(os.path.dirname(os.path.abspath(opts.writ)), "writd")
+
+    def via_writd(name, *writd_flags):
+        """Runs the workload through a fresh writd with its own socket and log."""
+        socket = os.path.join(work, name, "writd.sock")
+        log = os.path.join(log_dir, f"{name}.jsonl")
+        if os.path.exists(log):
+            os.remove(log)
+        writd = subprocess.Popen([writd_bin, "--socket", socket, "--log", log, *writd_flags])
+        try:
+            while not os.path.exists(socket):
+                time.sleep(0.01)
+            argv = [opts.writ, "wrap", "--daemon", "--policy", policy, "--", *server]
+            return measure(argv, {**env, "WRIT_SOCKET": socket}, "postgres.query", opts.calls)
+        finally:
+            writd.send_signal(signal.SIGTERM)
+            writd.wait()
+
     runs = {
         "direct": measure(server, env, "postgres.query", opts.calls),
-        "allowed": measure(wrapped("allowed.jsonl"), env, "postgres.query", opts.calls),
-        "fsync": measure(wrapped("fsync.jsonl", "--fsync"), env, "postgres.query", opts.calls),
+        "standalone": measure(wrapped("standalone.jsonl"), env, "postgres.query", opts.calls),
+        "nofsync": measure(wrapped("nofsync.jsonl", "--no-fsync"), env, "postgres.query", opts.calls),
+        "daemon": via_writd("daemon"),
+        "daemon-nofsync": via_writd("daemon-nofsync", "--no-fsync"),
         "denied": measure(wrapped("denied.jsonl"), env, "shell.exec", opts.calls),
     }
 
     print(f"{opts.calls} sequential tools/call round trips per run (after {WARMUP} warm-up), microseconds")
-    print(f"{'':10}{'p50':>9}{'p90':>9}{'p99':>9}{'max':>9}{'mean':>9}")
+    print(f"{'':15}{'p50':>9}{'p90':>9}{'p99':>9}{'max':>9}{'mean':>9}")
     for name, samples in runs.items():
         row = [percentile(samples, p) for p in (50, 90, 99)] + [max(samples), statistics.fmean(samples)]
-        print(f"{name:10}" + "".join(f"{v:9.0f}" for v in row))
-    for variant in ("allowed", "fsync"):
+        print(f"{name:15}" + "".join(f"{v:9.0f}" for v in row))
+    for variant in ("standalone", "nofsync", "daemon", "daemon-nofsync", "denied"):
         for p in (50, 99):
             overhead = percentile(runs[variant], p) - percentile(runs["direct"], p)
             print(f"writ overhead ({variant}) at p{p}: {overhead:.0f} us")

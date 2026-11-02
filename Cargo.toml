@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/writ-policy", "crates/writ-recorder", "crates/writ-proxy", "crates/writ-cli"]
+members = ["crates/writ-policy", "crates/writ-recorder", "crates/writ-daemon", "crates/writ-proxy", "crates/writ-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ rust-version = "1.89"
 [workspace.dependencies]
 writ-policy = { path = "crates/writ-policy" }
 writ-recorder = { path = "crates/writ-recorder" }
+writ-daemon = { path = "crates/writ-daemon" }
 writ-proxy = { path = "crates/writ-proxy" }
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }

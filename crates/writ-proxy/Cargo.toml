@@ -11,6 +11,7 @@ anyhow.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+writ-daemon.workspace = true
 writ-policy.workspace = true
 writ-recorder.workspace = true
 

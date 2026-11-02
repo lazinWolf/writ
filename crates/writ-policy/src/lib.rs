@@ -75,7 +75,7 @@ enum Violation {
 }
 
 /// Outcomes ordered from least to most restrictive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Allow,
@@ -83,7 +83,7 @@ pub enum Outcome {
     Deny,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub outcome: Outcome,
     /// Pattern of the rule that produced the outcome; `None` for deny-by-default.

@@ -178,10 +178,9 @@ fn redacts_arguments_and_records_server_requests() {
     assert!(calls[1]["data"].get("arguments").is_none());
 
     let request = s.entry("server_request").expect("server_request recorded");
-    assert_eq!(
-        request["data"],
-        json!({ "id": "srv-1", "method": "sampling/createMessage" })
-    );
+    assert_eq!(request["data"]["method"], "sampling/createMessage");
+    assert_eq!(request["data"]["id"], "srv-1");
+    assert!(request["data"].get("params").is_none(), "params may carry prompts");
 }
 
 #[test]
@@ -241,7 +240,7 @@ fn forwards_sigterm_to_the_server() {
     require_python!();
     let mut s = Session::start("", "5s");
     let start = s.wait_for_entry("session_start");
-    let server_pid = start["data"]["server_pid"].as_u64().unwrap();
+    let server_pid = start["data"]["info"]["server_pid"].as_u64().unwrap();
     assert!(alive(server_pid));
 
     let killed = Command::new("kill")

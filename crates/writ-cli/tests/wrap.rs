@@ -161,10 +161,11 @@ fn enforces_policy_end_to_end() {
         );
     }
 
-    // The flight recorder has a verifiable chain with one decision per call.
+    // The flight recorder has a verifiable chain with one decision per call:
+    // task_start, session_start, 6 tool_call, 2 tool_result, tools_hidden, session_end, task_end.
     assert_eq!(
         writ_recorder_verify(&run.log),
-        11,
+        13,
         "{}",
         std::fs::read_to_string(&run.log).unwrap()
     );
@@ -178,8 +179,9 @@ fn enforces_policy_end_to_end() {
                 .to_string()
         })
         .collect();
-    assert_eq!(kinds.first().map(String::as_str), Some("session_start"));
-    assert_eq!(kinds.last().map(String::as_str), Some("session_end"));
+    // A standalone wrap is an implicit task with one session.
+    assert_eq!(kinds[..2], ["task_start", "session_start"]);
+    assert_eq!(kinds[kinds.len() - 2..], ["session_end", "task_end"]);
     assert_eq!(kinds.iter().filter(|k| *k == "tool_call").count(), 6);
     assert_eq!(kinds.iter().filter(|k| *k == "tool_result").count(), 2);
 }

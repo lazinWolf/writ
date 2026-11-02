@@ -1,0 +1,20 @@
+[package]
+name = "writ-daemon"
+description = "writd: task registry, decision engine, and its local socket protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+thiserror.workspace = true
+writ-policy.workspace = true
+writ-recorder.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

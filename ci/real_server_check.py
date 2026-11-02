@@ -105,7 +105,11 @@ def main():
     expect(
         results == ["echo", "trigger-log-messages"], "only the allowed calls produced a tool_result", f"got {results}"
     )
-    expect(kinds[0] == "session_start" and kinds[-1] == "session_end", "log brackets the session", str(kinds))
+    expect(
+        kinds[:2] == ["task_start", "session_start"] and kinds[-2:] == ["session_end", "task_end"],
+        "log brackets the task and session",
+        str(kinds),
+    )
 
     print(f"tools hidden by policy: {len(hidden)} ({', '.join(sorted(hidden))})")
     print(f"server-originated messages passed through: {len(client.notifications)}")
