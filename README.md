@@ -1,6 +1,6 @@
 # writ
 
-Policy and lineage layer for agent tool calls. See `plan-v2.md` for the full plan.
+Policy and lineage layer for agent tool calls. See `plan-v2.md` for the full plan and `OBSERVATIONS.md` for where things stand.
 
 This is Phase 0 work, in cooperative mode: `writ wrap` (a stdio MCP proxy), `writd` (the local daemon that owns tasks and decisions), `writ run` (start an agent as a task), and `writ ps`.
 
