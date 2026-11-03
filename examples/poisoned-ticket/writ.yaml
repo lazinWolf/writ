@@ -1,0 +1,59 @@
+# The poisoned-ticket demo policy (plan-v2.md §7.1, scenario 1).
+#
+# DRAFT SYNTAX: this file describes the target, and today's build rejects it
+# at load time (data_flow, privileged, lookup, entitlements, ... are not
+# enforced yet). ROADMAP.md steps 2–6 make it load and enforce, one feature
+# at a time. The end-to-end test `crates/writ-cli/tests/demo.rs` runs it.
+#
+# Precedence (D9): every matching rule is evaluated and the most restrictive
+# outcome wins: deny > require_sudo > allow.
+version: 1
+namespace: support-refunds
+enforcement: cooperative
+
+limits:
+  max_tool_calls: 50
+
+data_flow:
+  # Content from these sessions may be attacker-written. An allowed call to
+  # one of them taints the whole task (one branch until `writ fork` exists).
+  untrusted_sources: ["mcp:zendesk-tickets"]
+  on_taint:
+    # On a tainted task, a privileged tool needs a human, unless the rule has
+    # entitlements and they all hold for this call.
+    privileged_mutations: require_sudo
+
+# Where `writ.root.*` and lookup tables come from. Mock first; a Stripe-backed
+# resolver replaces it behind the same interface.
+entitlements:
+  source: file
+  path: entitlements.yaml          # relative to this policy file
+
+approvals:
+  timeout: 15m                     # no decision in time: the call is denied
+
+capabilities:
+  - tool: "zendesk.get_ticket"
+
+  - tool: "stripe.get_charge"
+
+  - tool: "stripe.refund"
+    privileged: true
+    lookup:
+      charge: { table: charges, key: args.charge }
+    entitlements:                  # bound to the root principal's authority
+      - "charge.customer in writ.root.entitled_customers"
+      - "args.amount <= charge.amount"
+    on_entitlement_violation: deny
+    conditions:                    # auto-approve only inside these bounds
+      - "args.amount <= 100.00"
+    on_violation: require_sudo
+
+  - tool: "stripe.add_credit"
+    privileged: true               # no entitlement covers it: tainted means ask a human
+    conditions:
+      - "args.amount <= 25"
+    on_violation: require_sudo
+
+  - tool: "*"
+    action: deny

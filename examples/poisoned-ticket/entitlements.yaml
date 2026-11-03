@@ -1,0 +1,17 @@
+# Mock entitlement source for the poisoned-ticket demo.
+#
+# `principals.<root principal>` becomes `writ.root.*` for a task started with
+# `writ run --principal <root principal>`. `tables.<name>.<key>` is what a
+# rule's `lookup:` binds. In production these answers come from the system of
+# record (Stripe customer ownership, a CRM, IdP groups), not from a file.
+#
+# The charges must match crates/writ-cli/tests/fixtures/fake_stripe.py.
+principals:
+  alice@example.com:
+    entitled_customers: [cus_alice]
+
+tables:
+  charges:
+    ch_alice_small: { customer: cus_alice, amount: 40.00 }
+    ch_alice_big:   { customer: cus_alice, amount: 240.00 }
+    ch_bob_1:       { customer: cus_bob,   amount: 5000.00 }
