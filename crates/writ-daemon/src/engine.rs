@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use writ_policy::{Decision, DecisionContext, Facts, Outcome, Policy};
+use writ_policy::{Decision, DecisionContext, Facts, Outcome, Policy, SessionFacts};
 use writ_recorder::{Recorder, RecorderError};
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +70,8 @@ struct Task {
 
 struct Session {
     task: String,
+    /// `mcp:<name>`.
+    source: String,
     policy: Option<LoadedPolicy>,
     counters: Counters,
 }
@@ -84,6 +86,14 @@ pub struct TaskSummary {
     pub sessions: usize,
     pub max_tool_calls: Option<u64>,
     pub counters: Counters,
+    #[serde(default)]
+    pub tainted: bool,
+    /// Untrusted sources the task has read from, in order.
+    #[serde(default)]
+    pub taint_sources: Vec<String>,
+    /// The sources (`mcp:<name>`) of its open sessions.
+    #[serde(default)]
+    pub servers: Vec<String>,
 }
 
 pub struct Engine {
@@ -154,15 +164,19 @@ impl Engine {
         Ok(())
     }
 
-    /// Opens a session. With a task it joins that task, optionally narrowed by
-    /// `own_policy`; without one, `own_policy` is required and becomes an
-    /// implicit task of its own. `info` (command, server pid) is recorded.
+    /// Opens a session for the server `name` (its source is `mcp:<name>`).
+    /// With a task it joins that task, optionally narrowed by `own_policy`;
+    /// without one, `own_policy` is required and becomes an implicit task of
+    /// its own. `info` (command, server pid) is recorded.
     pub fn open_session(
         &mut self,
         task: Option<&str>,
         own_policy: Option<LoadedPolicy>,
+        name: &str,
         info: Value,
     ) -> Result<String, EngineError> {
+        writ_policy::validate_session_name(name).map_err(EngineError::Invalid)?;
+        let source = writ_policy::session_source(name);
         let (task_id, session_policy) = match task {
             Some(id) => {
                 let task = self
@@ -184,6 +198,7 @@ impl Engine {
         let id = new_id("ses");
         let data = json!({
             "task": task_id,
+            "source": source,
             "narrowing_policy_sha256": session_policy.as_ref().map(|p| &p.sha256),
             "info": info,
         });
@@ -197,6 +212,7 @@ impl Engine {
             id.clone(),
             Session {
                 task: task_id,
+                source,
                 policy: session_policy,
                 counters: Counters::default(),
             },
@@ -223,7 +239,12 @@ impl Engine {
             .expect("sessions always reference a live task");
 
         // Facts are computed here, by writd, never taken from the agent or the server.
-        let facts = task.facts.clone();
+        let facts = Facts {
+            session: SessionFacts {
+                name: Some(session.source.clone()),
+            },
+            ..task.facts.clone()
+        };
         let ctx = DecisionContext::new(tool, args, &facts);
         let mut decision = if task.ended {
             Decision {
@@ -292,12 +313,33 @@ impl Engine {
         // A denial is persisted by the next sync, and a flood of denied calls (the shape
         // of an injection attempt) cannot force a sync per call.
         let allowed = decision.outcome == Outcome::Allow;
+        // An allowed call to an untrusted source taints its task before the call is
+        // forwarded: its result is about to enter the agent's context. Either policy
+        // may declare the source untrusted. Taint is never cleared.
+        let source = &session.source;
+        let taints = allowed
+            && !task.facts.taint_sources.contains(source)
+            && (task.policy.policy.is_untrusted(source)
+                || session.policy.as_ref().is_some_and(|p| p.policy.is_untrusted(source)));
+        let task_id = session.task.clone();
+        if taints {
+            let source = source.clone();
+            // Recorded first and durably: if this fails the call is denied, and a
+            // taint without its call is the safe side to err on.
+            self.recorder.append_durable(
+                session_id,
+                "taint",
+                json!({ "task": task_id, "source": source, "id": call_id, "tool": tool }),
+            )?;
+            let facts = &mut self.tasks.get_mut(&task_id).expect("task exists").facts;
+            facts.tainted = true;
+            facts.taint_sources.push(source);
+        }
         if allowed {
             self.recorder.append_durable(session_id, "tool_call", data)?;
         } else {
             self.recorder.append(session_id, "tool_call", data)?;
         }
-        let task_id = session.task.clone();
         for counters in [
             &mut self.sessions.get_mut(session_id).unwrap().counters,
             &mut self.tasks.get_mut(&task_id).unwrap().counters,
@@ -389,6 +431,13 @@ impl Engine {
                 sessions: t.sessions.len(),
                 max_tool_calls: t.policy.policy.limits.max_tool_calls,
                 counters: t.counters.clone(),
+                tainted: t.facts.tainted,
+                taint_sources: t.facts.taint_sources.clone(),
+                servers: t
+                    .sessions
+                    .iter()
+                    .filter_map(|s| self.sessions.get(s).map(|s| s.source.clone()))
+                    .collect(),
             })
             .collect();
         tasks.sort_by_key(|t| t.started_ms);
@@ -462,7 +511,7 @@ capabilities:
         let (mut e, _dir) = engine();
         let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
         let s = e
-            .open_session(Some(&task), Some(policy(SESSION_POLICY)), json!({}))
+            .open_session(Some(&task), Some(policy(SESSION_POLICY)), "srv", json!({}))
             .unwrap();
 
         assert_eq!(
@@ -487,8 +536,8 @@ capabilities:
     fn task_limits_are_shared_across_sessions() {
         let (mut e, _dir) = engine();
         let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
-        let a = e.open_session(Some(&task), None, json!({})).unwrap();
-        let b = e.open_session(Some(&task), None, json!({})).unwrap();
+        let a = e.open_session(Some(&task), None, "srv", json!({})).unwrap();
+        let b = e.open_session(Some(&task), None, "srv", json!({})).unwrap();
 
         assert_eq!(decide(&mut e, &a, "db.query", json!({})), Outcome::Allow);
         assert_eq!(decide(&mut e, &b, "db.query", json!({})), Outcome::Allow);
@@ -512,18 +561,18 @@ capabilities:
     fn ending_a_task_revokes_its_sessions() {
         let (mut e, _dir) = engine();
         let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
-        let s = e.open_session(Some(&task), None, json!({})).unwrap();
+        let s = e.open_session(Some(&task), None, "srv", json!({})).unwrap();
         e.end_task(&task, "test").unwrap();
 
         let d = e.decide(&s, &json!(1), "db.query", &json!({})).unwrap();
         assert_eq!(d.outcome, Outcome::Deny);
         assert!(d.reason.contains("revoked"));
         assert!(e.tasks().is_empty());
-        assert!(e.open_session(Some(&task), None, json!({})).is_err());
+        assert!(e.open_session(Some(&task), None, "srv", json!({})).is_err());
 
         e.close_session(&s, json!({})).unwrap();
         assert!(matches!(
-            e.open_session(Some(&task), None, json!({})),
+            e.open_session(Some(&task), None, "srv", json!({})),
             Err(EngineError::UnknownTask(_))
         ));
     }
@@ -531,18 +580,94 @@ capabilities:
     #[test]
     fn standalone_sessions_get_an_implicit_task() {
         let (mut e, _dir) = engine();
-        assert!(e.open_session(None, None, json!({})).is_err());
-        let s = e.open_session(None, Some(policy(TASK_POLICY)), json!({})).unwrap();
+        assert!(e.open_session(None, None, "srv", json!({})).is_err());
+        let s = e
+            .open_session(None, Some(policy(TASK_POLICY)), "srv", json!({}))
+            .unwrap();
         assert_eq!(e.tasks().len(), 1);
         e.close_session(&s, json!({})).unwrap();
         assert!(e.tasks().is_empty(), "implicit task ends with its session");
+    }
+
+    const TAINT_POLICY: &str = r#"
+version: 1
+namespace: taint
+data_flow:
+  untrusted_sources: ["mcp:tickets"]
+capabilities:
+  - tool: "tickets.read"
+  - tool: "tickets.locked"
+    action: deny
+  - tool: "stripe.refund"
+    privileged: true
+  - tool: "stripe.get_charge"
+"#;
+
+    #[test]
+    fn reading_an_untrusted_source_taints_the_whole_task() {
+        let (mut e, dir) = engine();
+        let task = e.create_task(policy(TAINT_POLICY), json!({})).unwrap();
+        let tickets = e.open_session(Some(&task), None, "tickets", json!({})).unwrap();
+        let stripe = e.open_session(Some(&task), None, "stripe", json!({})).unwrap();
+
+        assert_eq!(decide(&mut e, &stripe, "stripe.refund", json!({})), Outcome::Allow);
+        // A denied call to the untrusted source doesn't taint: nothing was read.
+        assert_eq!(decide(&mut e, &tickets, "tickets.locked", json!({})), Outcome::Deny);
+        assert!(!e.tasks()[0].tainted);
+
+        assert_eq!(decide(&mut e, &tickets, "tickets.read", json!({})), Outcome::Allow);
+        assert_eq!(decide(&mut e, &tickets, "tickets.read", json!({})), Outcome::Allow);
+        // The taint applies across sessions: the refund now needs a human.
+        let d = e.decide(&stripe, &json!(9), "stripe.refund", &json!({})).unwrap();
+        assert_eq!(d.outcome, Outcome::RequireSudo);
+        assert!(d.reason.contains("mcp:tickets"), "{}", d.reason);
+        assert_eq!(decide(&mut e, &stripe, "stripe.get_charge", json!({})), Outcome::Allow);
+
+        let summary = &e.tasks()[0];
+        assert!(summary.tainted);
+        assert_eq!(summary.taint_sources, ["mcp:tickets"]);
+        assert_eq!(summary.servers, ["mcp:tickets", "mcp:stripe"]);
+
+        let log = writ_recorder::read_entries(dir.path().join("flight.jsonl")).unwrap();
+        let taints: Vec<_> = log.iter().filter(|entry| entry.kind == "taint").collect();
+        assert_eq!(taints.len(), 1, "tainted once");
+        assert_eq!(taints[0].data["source"], "mcp:tickets");
+        let refund = log
+            .iter()
+            .rfind(|entry| entry.kind == "tool_call" && entry.data["tool"] == "stripe.refund")
+            .unwrap();
+        assert_eq!(refund.data["facts"]["tainted"], json!(true));
+        assert_eq!(refund.data["facts"]["session"]["name"], "mcp:stripe");
+    }
+
+    #[test]
+    fn a_narrowing_policy_can_declare_more_untrusted_sources() {
+        let (mut e, _dir) = engine();
+        let task = e.create_task(policy(TAINT_POLICY), json!({})).unwrap();
+        let narrow = "version: 1\nnamespace: n\ndata_flow:\n  untrusted_sources: [\"mcp:web\"]\ncapabilities:\n  - tool: \"*\"\n";
+        let web = e
+            .open_session(Some(&task), Some(policy(narrow)), "web", json!({}))
+            .unwrap();
+        // The task's policy has no rule for web.fetch, so it's denied: no taint.
+        assert_eq!(decide(&mut e, &web, "web.fetch", json!({})), Outcome::Deny);
+        assert!(!e.tasks()[0].tainted);
+        assert_eq!(decide(&mut e, &web, "stripe.get_charge", json!({})), Outcome::Allow);
+        assert_eq!(e.tasks()[0].taint_sources, ["mcp:web"]);
+    }
+
+    #[test]
+    fn rejects_bad_server_names() {
+        let (mut e, _dir) = engine();
+        let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
+        assert!(e.open_session(Some(&task), None, "bad name", json!({})).is_err());
+        assert!(e.open_session(Some(&task), None, "", json!({})).is_err());
     }
 
     #[test]
     fn decisions_record_the_facts_they_saw() {
         let (mut e, dir) = engine();
         let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
-        let s = e.open_session(Some(&task), None, json!({})).unwrap();
+        let s = e.open_session(Some(&task), None, "srv", json!({})).unwrap();
         decide(&mut e, &s, "db.query", json!({}));
 
         let log = writ_recorder::read_entries(dir.path().join("flight.jsonl")).unwrap();
@@ -557,7 +682,7 @@ capabilities:
         let (mut e, dir) = engine();
         let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
         let s = e
-            .open_session(Some(&task), Some(policy(SESSION_POLICY)), json!({}))
+            .open_session(Some(&task), Some(policy(SESSION_POLICY)), "srv", json!({}))
             .unwrap();
         decide(
             &mut e,

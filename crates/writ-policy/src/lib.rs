@@ -22,7 +22,7 @@ use serde_json::Value;
 
 pub use condition::Condition;
 use context::Scope;
-pub use context::{DecisionContext, Facts, Root, SessionFacts};
+pub use context::{DecisionContext, Facts, Root, SessionFacts, session_source, validate_session_name};
 pub use redact::MARKER as REDACTED;
 use redact::RedactPath;
 
@@ -37,11 +37,13 @@ pub enum PolicyError {
 }
 
 /// Spec fields that are part of writ.yaml but not enforced by this build.
-const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &["data_flow"];
+const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &["entitlements", "approvals"];
+const UNIMPLEMENTED_DATA_FLOW: &[&str] = &["secrets", "pii_fields", "declassify"];
+const UNIMPLEMENTED_ON_TAINT: &[&str] = &["other_mutations", "egress_to_untrusted_sinks"];
 const UNIMPLEMENTED_LIMITS: &[&str] = &["max_depth", "max_parallel_agents", "max_budget_usd", "loop_breaker"];
 const UNIMPLEMENTED_RULE: &[&str] = &[
-    "privileged",
     "idempotency",
+    "lookup",
     "entitlements",
     "preconditions",
     "classify",
@@ -108,6 +110,8 @@ struct Rule {
     on_violation: Violation,
     redact: Vec<RedactPath>,
     record_arguments: bool,
+    /// Guarded on tainted tasks (`data_flow.on_taint.privileged_mutations`).
+    privileged: bool,
 }
 
 /// How a call's arguments may appear in the flight recorder, merged across
@@ -128,6 +132,11 @@ pub struct Policy {
     pub namespace: String,
     pub enforcement: Enforcement,
     pub limits: Limits,
+    /// Sources whose content may be attacker-written (`mcp:<name>`). An
+    /// allowed call to one taints its task.
+    pub untrusted_sources: Vec<String>,
+    /// What a privileged tool gets on a tainted task.
+    on_taint_privileged: Outcome,
     rules: Vec<Rule>,
     fallback: Option<Rule>,
 }
@@ -142,7 +151,33 @@ struct RawPolicy {
     #[serde(default)]
     limits: RawLimits,
     #[serde(default)]
+    data_flow: RawDataFlow,
+    #[serde(default)]
     capabilities: Vec<RawRule>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawDataFlow {
+    #[serde(default)]
+    untrusted_sources: Vec<String>,
+    #[serde(default)]
+    on_taint: RawOnTaint,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawOnTaint {
+    #[serde(default)]
+    privileged_mutations: TaintAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaintAction {
+    #[default]
+    RequireSudo,
+    Deny,
 }
 
 #[derive(Deserialize, Default)]
@@ -165,6 +200,8 @@ struct RawRule {
     redact: Vec<String>,
     #[serde(default = "default_true")]
     record_arguments: bool,
+    #[serde(default)]
+    privileged: bool,
 }
 
 fn default_true() -> bool {
@@ -195,6 +232,15 @@ impl Policy {
             )));
         }
 
+        for source in &raw.data_flow.untrusted_sources {
+            let name = source.strip_prefix("mcp:").ok_or_else(|| {
+                invalid(format!(
+                    "untrusted source `{source}`: only MCP servers (`mcp:<name>`) are supported in this build"
+                ))
+            })?;
+            validate_session_name(name).map_err(|e| invalid(format!("untrusted source `{source}`: {e}")))?;
+        }
+
         let mut rules = Vec::new();
         let mut fallback = None;
         for raw_rule in raw.capabilities {
@@ -211,6 +257,11 @@ impl Policy {
         Ok(Policy {
             namespace: raw.namespace,
             enforcement: raw.enforcement,
+            untrusted_sources: raw.data_flow.untrusted_sources,
+            on_taint_privileged: match raw.data_flow.on_taint.privileged_mutations {
+                TaintAction::RequireSudo => Outcome::RequireSudo,
+                TaintAction::Deny => Outcome::Deny,
+            },
             limits: Limits {
                 max_tool_calls: raw.limits.max_tool_calls,
             },
@@ -237,7 +288,26 @@ impl Policy {
         let first = decisions.next().expect("candidates is non-empty");
         // `max_by_key` keeps the last maximum; fold keeps the first, so the
         // reported rule is the earliest of the most restrictive ones.
-        decisions.fold(first, |best, d| if d.outcome > best.outcome { d } else { best })
+        let best = decisions.fold(first, |best, d| if d.outcome > best.outcome { d } else { best });
+
+        // A privileged tool on a tainted task: the task has read content that
+        // may be attacker-written, so its arguments may be attacker-steered.
+        match candidates.iter().find(|r| r.privileged) {
+            Some(rule) if ctx.facts.tainted && self.on_taint_privileged > best.outcome => Decision {
+                outcome: self.on_taint_privileged,
+                rule: Some(rule.pattern.clone()),
+                reason: format!(
+                    "`{tool}` is privileged and the task is tainted (it read from {})",
+                    ctx.facts.taint_sources.join(", ")
+                ),
+            },
+            _ => best,
+        }
+    }
+
+    /// True when content from `source` (`mcp:<name>`) may be attacker-written.
+    pub fn is_untrusted(&self, source: &str) -> bool {
+        self.untrusted_sources.iter().any(|s| s == source)
     }
 
     /// The arguments as they may be written to the flight recorder: `None`
@@ -308,6 +378,7 @@ impl Rule {
             on_violation: raw.on_violation,
             redact,
             record_arguments: raw.record_arguments,
+            privileged: raw.privileged,
         })
     }
 
@@ -359,6 +430,20 @@ fn reject_unimplemented(doc: &serde_norway::Value) -> Result<(), PolicyError> {
     for key in UNIMPLEMENTED_TOP_LEVEL {
         if has(doc, key) {
             return Err(not_enforced(key));
+        }
+    }
+    if let Some(data_flow) = doc.get("data_flow") {
+        for key in UNIMPLEMENTED_DATA_FLOW {
+            if has(data_flow, key) {
+                return Err(not_enforced(&format!("data_flow.{key}")));
+            }
+        }
+        if let Some(on_taint) = data_flow.get("on_taint") {
+            for key in UNIMPLEMENTED_ON_TAINT {
+                if has(on_taint, key) {
+                    return Err(not_enforced(&format!("data_flow.on_taint.{key}")));
+                }
+            }
         }
     }
     if let Some(limits) = doc.get("limits") {
@@ -464,14 +549,22 @@ capabilities:
     #[test]
     fn rejects_unimplemented_fields() {
         let cases = [
-            ("version: 1\nnamespace: t\ndata_flow: {}\n", "data_flow"),
+            (
+                "version: 1\nnamespace: t\ndata_flow:\n  declassify: []\n",
+                "data_flow.declassify",
+            ),
+            (
+                "version: 1\nnamespace: t\ndata_flow:\n  on_taint:\n    other_mutations: allow_within_limits\n",
+                "data_flow.on_taint.other_mutations",
+            ),
+            ("version: 1\nnamespace: t\napprovals: {}\n", "approvals"),
             (
                 "version: 1\nnamespace: t\nlimits:\n  max_depth: 4\n",
                 "limits.max_depth",
             ),
             (
-                "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    privileged: true\n",
-                "privileged",
+                "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    lookup: {}\n",
+                "lookup",
             ),
         ];
         for (yaml, field) in cases {
@@ -589,6 +682,62 @@ capabilities:
         assert!(!d.reason.contains("4242"), "{}", d.reason);
     }
 
+    const TAINT: &str = r#"
+version: 1
+namespace: t
+data_flow:
+  untrusted_sources: ["mcp:zendesk"]
+capabilities:
+  - tool: "zendesk.*"
+  - tool: "stripe.refund"
+    privileged: true
+    conditions: ["args.amount <= 100"]
+    on_violation: require_sudo
+  - tool: "stripe.get_charge"
+  - tool: "stripe.delete_customer"
+    privileged: true
+    action: deny
+"#;
+
+    #[test]
+    fn taint_guards_privileged_tools_only() {
+        let p = Policy::from_yaml_str(TAINT).unwrap();
+        assert!(p.is_untrusted("mcp:zendesk") && !p.is_untrusted("mcp:stripe"));
+        let tainted = Facts {
+            tainted: true,
+            taint_sources: vec!["mcp:zendesk".into()],
+            ..Facts::default()
+        };
+        let decide = |facts: &Facts, tool: &str, args: Value| p.evaluate(&DecisionContext::new(tool, &args, facts));
+
+        let clean = Facts::default();
+        assert_eq!(
+            decide(&clean, "stripe.refund", json!({"amount": 5})).outcome,
+            Outcome::Allow
+        );
+        let d = decide(&tainted, "stripe.refund", json!({"amount": 5}));
+        assert_eq!(d.outcome, Outcome::RequireSudo);
+        assert!(
+            d.reason.contains("tainted") && d.reason.contains("mcp:zendesk"),
+            "{}",
+            d.reason
+        );
+        // Non-privileged tools are unaffected.
+        assert_eq!(decide(&tainted, "stripe.get_charge", json!({})).outcome, Outcome::Allow);
+        // A stricter outcome stands, with its own reason.
+        let d = decide(&tainted, "stripe.delete_customer", json!({}));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("denied by rule"), "{}", d.reason);
+
+        let strict = Policy::from_yaml_str(&TAINT.replace(
+            "data_flow:\n",
+            "data_flow:\n  on_taint:\n    privileged_mutations: deny\n",
+        ))
+        .unwrap();
+        let d = strict.evaluate(&DecisionContext::new("stripe.refund", &json!({"amount": 5}), &tainted));
+        assert_eq!(d.outcome, Outcome::Deny);
+    }
+
     #[test]
     fn rejects_invalid_policies() {
         for yaml in [
@@ -598,6 +747,9 @@ capabilities:
             "version: 1\nnamespace: t\ncapabilities:\n  - tool: \"*\"\n  - tool: \"*\"\n",
             "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    action: deny\n    conditions: [\"args.a == 1\"]\n",
             "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    conditions: [\"writ.taint == false\"]\n",
+            "version: 1\nnamespace: t\ndata_flow:\n  untrusted_sources: [\"postgres:public.notes\"]\n",
+            "version: 1\nnamespace: t\ndata_flow:\n  untrusted_sources: [\"mcp:bad name\"]\n",
+            "version: 1\nnamespace: t\ndata_flow:\n  on_taint:\n    privileged_mutations: allow\n",
         ] {
             assert!(Policy::from_yaml_str(yaml).is_err(), "accepted: {yaml}");
         }

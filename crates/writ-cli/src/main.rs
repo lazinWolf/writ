@@ -28,6 +28,10 @@ enum Commands {
         /// Path to writ.yaml. Required unless WRIT_TASK is set.
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// The server's name. Its session is `mcp:<name>`, which is what policies match in
+        /// `data_flow.untrusted_sources` and `writ.session.name`. Derived from the command if omitted.
+        #[arg(long)]
+        name: Option<String>,
         /// Decide through writd (starting it if needed) so `writ ps` can see this session.
         #[arg(long)]
         daemon: bool,
@@ -93,15 +97,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Commands::Wrap {
             policy,
+            name,
             daemon,
             log,
             no_fsync,
             shutdown_grace,
             command,
         } => {
+            let name_derived = name.is_none();
+            let name = match name {
+                Some(name) => {
+                    writ_policy::validate_session_name(&name).map_err(anyhow::Error::msg)?;
+                    name
+                }
+                None => {
+                    let name = derive_server_name(&command);
+                    eprintln!(
+                        "writ: no --name given; this server is `{}`. Pass --name if a policy refers to it.",
+                        writ_policy::session_source(&name)
+                    );
+                    name
+                }
+            };
             let backend = wrap_backend(policy.as_deref(), daemon, log, !no_fsync)?;
             let config = writ_proxy::WrapConfig {
                 backend,
+                name,
+                name_derived,
                 command,
                 shutdown_grace,
                 forward_signals: true,
@@ -243,8 +265,8 @@ fn ps() -> Result<ExitCode> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     println!(
-        "{:<28}  {:<10}  {:<18}  {:>8}  {:>11}  {:>6}  {:>8}  COMMAND",
-        "TASK", "USER", "NAMESPACE", "SESSIONS", "CALLS", "DENIED", "AGE"
+        "{:<28}  {:<10}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  COMMAND",
+        "TASK", "USER", "NAMESPACE", "SESSIONS", "CALLS", "DENIED", "TAINTED", "AGE", "SERVERS"
     );
     for t in tasks {
         let calls = match t.max_tool_calls {
@@ -256,19 +278,54 @@ fn ps() -> Result<ExitCode> {
             .as_array()
             .map(|c| c.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
             .unwrap_or_else(|| "(standalone wrap)".to_string());
+        let servers = if t.servers.is_empty() {
+            "-".to_string()
+        } else {
+            t.servers.join(",")
+        };
         println!(
-            "{:<28}  {:<10}  {:<18}  {:>8}  {:>11}  {:>6}  {:>8}  {}",
+            "{:<28}  {:<10}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  {}",
             t.task,
             t.meta["user"].as_str().unwrap_or("-"),
             t.namespace,
             t.sessions,
             calls,
             t.counters.calls_denied,
+            if t.tainted { "YES" } else { "no" },
             age.to_string(),
+            servers,
             command
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A best-effort name from the server command: the last argument that isn't a
+/// flag, without its directory or extension. `npx -y @scope/server-postgres`
+/// becomes `server-postgres`; `python3 -I tools/fake.py` becomes `fake`.
+fn derive_server_name(command: &[String]) -> String {
+    let arg = command
+        .iter()
+        .rev()
+        .find(|a| !a.starts_with('-'))
+        .map_or("server", String::as_str);
+    let base = arg.rsplit('/').next().unwrap_or(arg);
+    let stem = match base.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => base,
+    };
+    let name: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    if name.is_empty() { "server".to_string() } else { name }
 }
 
 fn exit_code(code: i32) -> ExitCode {
@@ -294,7 +351,18 @@ fn format_entry(entry: &Entry) -> String {
             s(&d["namespace"]),
             s(&d["policy_sha256"]),
         ),
-        "session_start" => format!("{} (task {})", command(&d["info"]["command"]), s(&d["task"])),
+        "session_start" => format!(
+            "{} {} (task {})",
+            s(&d["source"]),
+            command(&d["info"]["command"]),
+            s(&d["task"])
+        ),
+        "taint" => format!(
+            "task {} tainted: {} read from {}",
+            s(&d["task"]),
+            s(&d["tool"]),
+            s(&d["source"])
+        ),
         "tool_call" => format!(
             "{} -> {} ({})",
             s(&d["tool"]),

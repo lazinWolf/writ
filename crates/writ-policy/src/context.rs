@@ -50,6 +50,30 @@ pub struct SessionFacts {
     pub name: Option<String>,
 }
 
+/// The source id of a wrapped MCP server named `name`: `mcp:<name>`. This is
+/// what `writ.session.name` holds and what `data_flow.untrusted_sources`
+/// lists.
+pub fn session_source(name: &str) -> String {
+    format!("mcp:{name}")
+}
+
+/// Checks a server name given to `writ wrap --name`: 1–64 characters from
+/// `[A-Za-z0-9_.-]`.
+pub fn validate_session_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid server name `{name}`: use 1-64 characters from A-Z, a-z, 0-9, `_`, `-`, `.`"
+        ))
+    }
+}
+
 /// The top-level `writ.*` fields a condition may read. Anything else is a
 /// policy error at load time, so a typo can't silently fail every call.
 pub(crate) const FACT_FIELDS: &[&str] = &["root", "tainted", "taint_sources", "session"];

@@ -98,17 +98,19 @@ Each item is sized to be one PR. Start at the top.
 
 ### Step 3: Name sessions (blocker 3, about 1 day)
 
-- [ ] Add `writ wrap --name zendesk-tickets` and record it in `session_start`. The session's identity is `mcp:<name>`.
-- [ ] Without `--name`, derive a name from the command and warn that it can't be matched by `untrusted_sources`.
-- [ ] Show session names in `writ ps` (add a `--sessions` flag or a detail view).
+- [x] Add `writ wrap --name zendesk-tickets` and record it in `session_start`. The session's identity is `mcp:<name>`.
+- [x] Without `--name`, derive a name from the command and warn. (It does still match `untrusted_sources`, erring toward taint.)
+- [x] Show session names in `writ ps` (add a `--sessions` flag or a detail view).
 
 ### Step 4: Coarse taint (about 3–4 days)
 
-- [ ] Accept `data_flow.untrusted_sources` in `writ.yaml`, and remove `data_flow` from `UNIMPLEMENTED_TOP_LEVEL` for just that sub-field. Keep rejecting `declassify`, `secrets` and the others.
-- [ ] Taint the task when an **allowed** call goes to an untrusted session, *before* it's forwarded, as part of the same durable decision entry. This is conservative (the result is going to arrive anyway) and needs no new round trip.
-- [ ] Accept rule field `privileged: true` and `data_flow.on_taint.privileged_mutations: require_sudo | deny`. Precedence follows D9.
-- [ ] Add a `taint` flight-log event (source, triggering call), and show a `TAINTED` column in `writ ps`.
-- [ ] Unit tests: taint is per task, shared across sessions, never cleared, and survives in the log.
+- [x] Accept `data_flow.untrusted_sources` in `writ.yaml`, and remove `data_flow` from `UNIMPLEMENTED_TOP_LEVEL` for just that sub-field. Keep rejecting `declassify`, `secrets` and the others.
+- [x] Taint the task when an **allowed** call goes to an untrusted session, *before* it's forwarded, as part of the same durable decision entry. This is conservative (the result is going to arrive anyway) and needs no new round trip.
+- [x] Accept rule field `privileged: true` and `data_flow.on_taint.privileged_mutations: require_sudo | deny`. Precedence follows D9.
+- [x] Add a `taint` flight-log event (source, triggering call), and show a `TAINTED` column in `writ ps`.
+- [x] Unit tests: taint is per task, shared across sessions, never cleared, and survives in the log.
+
+**Steps 3–4 status:** done. A derived name still matches `untrusted_sources`, which errs toward tainting; the warning tells you to name servers explicitly. Until step 5, a privileged tool on a tainted task always needs a human: the "unless its entitlements all hold" exemption arrives with entitlements. `writ ps` shows TAINTED and SERVERS columns. The demo test now stops at `entitlements` (step 5) instead of `data_flow`.
 
 ### Step 5: Entitlements with a mock resolver (about 3–4 days)
 

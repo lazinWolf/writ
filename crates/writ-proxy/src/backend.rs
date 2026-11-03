@@ -9,8 +9,9 @@ use writ_policy::Decision;
 use writ_recorder::Recorder;
 
 pub trait Backend: Send {
-    /// Opens the session; `info` (command, server pid) is recorded.
-    fn open(&mut self, info: Value) -> Result<String>;
+    /// Opens the session for the server `name`; `info` (command, server pid)
+    /// is recorded.
+    fn open(&mut self, name: &str, info: Value) -> Result<String>;
     /// Decides and records one call. `Err` means the call must be denied.
     fn decide(&mut self, call_id: &Value, tool: &str, args: &Value) -> Result<Decision>;
     fn record(&mut self, kind: &str, data: Value) -> Result<()>;
@@ -40,8 +41,8 @@ impl LocalBackend {
 }
 
 impl Backend for LocalBackend {
-    fn open(&mut self, info: Value) -> Result<String> {
-        let session = self.engine.open_session(None, self.policy.take(), info)?;
+    fn open(&mut self, name: &str, info: Value) -> Result<String> {
+        let session = self.engine.open_session(None, self.policy.take(), name, info)?;
         self.session = Some(session.clone());
         Ok(session)
     }
@@ -81,9 +82,9 @@ impl DaemonBackend {
 }
 
 impl Backend for DaemonBackend {
-    fn open(&mut self, info: Value) -> Result<String> {
+    fn open(&mut self, name: &str, info: Value) -> Result<String> {
         self.client
-            .open_session(self.task.as_deref(), self.policy.as_deref(), info)
+            .open_session(self.task.as_deref(), self.policy.as_deref(), name, info)
     }
 
     fn decide(&mut self, call_id: &Value, tool: &str, args: &Value) -> Result<Decision> {

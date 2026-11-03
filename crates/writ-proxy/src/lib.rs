@@ -43,6 +43,10 @@ pub struct WrapConfig {
     pub backend: Box<dyn Backend>,
     /// Server program followed by its arguments.
     pub command: Vec<String>,
+    /// The server's name; its session is `mcp:<name>`.
+    pub name: String,
+    /// True when `name` was derived from the command rather than given.
+    pub name_derived: bool,
     /// How long the server gets to exit after the client closes stdin (or
     /// after it closes its own stdout) before writ terminates it.
     pub shutdown_grace: Duration,
@@ -100,10 +104,10 @@ where
         pending_calls: HashMap::new(),
         pending_lists: HashSet::new(),
     };
-    if let Err(e) = state
-        .backend
-        .open(json!({ "command": config.command, "server_pid": pid }))
-    {
+    if let Err(e) = state.backend.open(
+        &config.name,
+        json!({ "command": config.command, "server_pid": pid, "name_derived": config.name_derived }),
+    ) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(e);

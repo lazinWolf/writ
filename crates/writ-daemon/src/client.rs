@@ -85,10 +85,17 @@ impl Client {
         Ok(())
     }
 
-    pub fn open_session(&mut self, task: Option<&str>, policy: Option<&str>, info: Value) -> Result<String> {
+    pub fn open_session(
+        &mut self,
+        task: Option<&str>,
+        policy: Option<&str>,
+        name: &str,
+        info: Value,
+    ) -> Result<String> {
         let body = self.request(&Request::OpenSession {
             task: task.map(str::to_string),
             policy: policy.map(str::to_string),
+            name: name.to_string(),
             info,
         })?;
         string_field(&body, "session")

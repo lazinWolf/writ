@@ -20,8 +20,8 @@ writ run --policy writ.yaml -- my-agent --flags
 `writ ps` lists live tasks:
 
 ```text
-TASK                          USER        NAMESPACE           SESSIONS        CALLS  DENIED       AGE  COMMAND
-tsk_18e45a…                   dividh      prod-customer-ops          2       41/200       3       12m  my-agent --flags
+TASK                          USER        NAMESPACE           SESSIONS        CALLS  DENIED  TAINTED       AGE  SERVERS                   COMMAND
+tsk_18e45a…                   dividh      prod-customer-ops          2       41/200       3  YES           12m  mcp:zendesk,mcp:stripe    my-agent --flags
 ```
 
 **Not yet a security boundary between processes.** `WRIT_TASK` is an unsigned ID: any process running as the same user can claim any task. Cooperative mode already trusts the agent framework to route calls through writ (plan-v2.md §5.2). Signed, attenuating writ tokens replace this ID next.
@@ -39,6 +39,8 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 ## What is enforced
 
 - **Tool rules** from `writ.yaml`: glob patterns, `allow`/`deny`, and conditions over the call's arguments and the task's facts: `args.amount <= 100.00`, `args.customer in writ.root.entitled_customers`, `writ.tainted == false`. Facts are computed by writ, never supplied by the agent or server, and are recorded with every decision. In this build no task has a root principal or taint yet (they arrive with the demo, see `ROADMAP.md`), so `writ.tainted` is always `false` and any condition reading `writ.root.*` fails closed. Every matching rule is evaluated and the most restrictive outcome wins (D9). `tool: "*"` applies only to tools no other rule matches. A tool no rule matches is denied.
+- **Server names:** `writ wrap --name zendesk` makes the session `mcp:zendesk`, the name policies match in `data_flow.untrusted_sources` and see as `writ.session.name`. Without `--name`, writ derives one from the command (`npx -y @scope/server-postgres` → `mcp:server-postgres`) and warns. Name servers explicitly whenever a policy refers to them.
+- **Taint (coarse, per task):** list servers whose content may be attacker-written in `data_flow.untrusted_sources: ["mcp:zendesk"]`. The first **allowed** call to one of them taints the whole task, across all its servers, before the call is forwarded. Denied calls don't taint, and taint is never cleared. On a tainted task, a tool whose rule says `privileged: true` gets `data_flow.on_taint.privileged_mutations` (`require_sudo` by default, or `deny`); other tools are unaffected. The flight log records a `taint` event, every decision records the facts it saw, and `writ ps` shows a TAINTED column. Either the task's policy or a narrowing policy can declare a source untrusted.
 - **`limits.max_tool_calls`**, per task, and also per session when a narrowing policy sets it.
 - **`on_violation: require_sudo`** is recognized, but there's no approval broker yet, so those calls are refused with an explanation.
 - **Flight recorder:** every decision is written to a hash-chained JSONL log before the call is forwarded, and an **allowed** decision reaches stable storage (fdatasync) first. Denials are written but not synced individually, so a flood of denied calls can't force a sync per call; the next sync persists them. If a decision can't be recorded, the call is denied. Use `--no-fsync` (on `writ wrap` or `writd`) to trade crash durability for latency.
@@ -47,11 +49,11 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 - **Server-initiated requests** (sampling, elicitation) are recorded by method only, and are not yet governed by policy.
 - **Shutdown:** the server runs in its own process group. If it outlives the client by more than `--shutdown-grace` (default 5s), writ sends SIGTERM to the group, then SIGKILL. That covers `npx` → `node` style launcher chains. Signals sent to writ are forwarded to the server.
 
-Any writ.yaml field from the spec that this build doesn't enforce (`data_flow`, `entitlements`, `max_depth`, `max_budget_usd`, …) is **rejected at load time**, so a policy never appears to grant a guarantee it doesn't have.
+Any writ.yaml field from the spec that this build doesn't enforce (`entitlements`, `approvals`, `data_flow.declassify`, `max_depth`, `max_budget_usd`, …) is **rejected at load time**, so a policy never appears to grant a guarantee it doesn't have.
 
 ## Not yet
 
-Signed writ tokens and lineage across hops, taint, approvals, and external anchoring of the log. In cooperative mode, an agent with a shell or raw network access can bypass writ (plan-v2.md §5.2).
+Signed writ tokens and lineage across hops, entitlements, approvals (so `require_sudo`, including on tainted tasks, refuses for now), finer-grained taint (per branch, per value), and external anchoring of the log. In cooperative mode, an agent with a shell or raw network access can bypass writ (plan-v2.md §5.2).
 
 ## Usage
 
@@ -67,7 +69,7 @@ In an MCP client config:
   "mcpServers": {
     "postgres-prod": {
       "command": "writ",
-      "args": ["wrap", "--policy", "./writ.yaml", "--", "npx", "-y", "@modelcontextprotocol/server-postgres"]
+      "args": ["wrap", "--name", "postgres-prod", "--policy", "./writ.yaml", "--", "npx", "-y", "@modelcontextprotocol/server-postgres"]
     }
   }
 }

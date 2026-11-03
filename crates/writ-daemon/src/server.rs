@@ -82,12 +82,17 @@ impl Connection {
                 self.tasks.retain(|t| t != &task);
                 Ok(Value::Null)
             }
-            Request::OpenSession { task, policy, info } => {
+            Request::OpenSession {
+                task,
+                policy,
+                name,
+                info,
+            } => {
                 if self.session.is_some() {
                     return Err(EngineError::Invalid("this connection already has a session".into()));
                 }
                 let policy = policy.as_deref().map(LoadedPolicy::parse).transpose()?;
-                let session = engine.open_session(task.as_deref(), policy, info)?;
+                let session = engine.open_session(task.as_deref(), policy, &name, info)?;
                 self.session = Some(session.clone());
                 Ok(json!({ "session": session }))
             }

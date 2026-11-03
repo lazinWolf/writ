@@ -23,6 +23,8 @@ pub enum Request {
     OpenSession {
         task: Option<String>,
         policy: Option<String>,
+        /// The wrapped server's name; the session is `mcp:<name>`.
+        name: String,
         info: Value,
     },
     /// Returns a `writ_policy::Decision`.
