@@ -1,0 +1,102 @@
+//! What a decision can see besides the call itself.
+//!
+//! A policy decides a call from three things: the tool name, its arguments
+//! (`args.*`), and **facts** about the task and session making it (`writ.*`).
+//! Facts are computed by writd, never supplied by the agent or the server.
+//!
+//! [`Facts`] is a plain serializable struct on purpose: it is recorded with
+//! every decision (so `writ log` and a later `writ replay` can see why a call
+//! was decided the way it was), and it is the shape a future export to Cedar,
+//! OPA, or AgentCore would carry (plan-v2.md D8).
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// The root of a task's authority: who the task acts for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Root {
+    /// The principal the task acts for, e.g. `alice@example.com`.
+    pub principal: String,
+    /// False until roots are minted from an identity proof (plan-v2.md §4.1).
+    pub verified: bool,
+    /// Entitlement attributes from the entitlement source (`writ.root.<name>`).
+    #[serde(flatten)]
+    pub attributes: Map<String, Value>,
+}
+
+/// Facts about the task and session a call belongs to, visible to
+/// conditions as `writ.*`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Facts {
+    /// `writ.root.*`. Absent when the task has no root principal, in which
+    /// case every condition that reads it fails (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<Root>,
+    /// `writ.tainted`: the task has read from a declared untrusted source.
+    #[serde(default)]
+    pub tainted: bool,
+    /// `writ.taint_sources`: which untrusted sources, in order first read.
+    #[serde(default)]
+    pub taint_sources: Vec<String>,
+    /// `writ.session.*`: the wrapped server this call goes to.
+    #[serde(default)]
+    pub session: SessionFacts,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionFacts {
+    /// `writ.session.name`, e.g. `mcp:zendesk-tickets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The top-level `writ.*` fields a condition may read. Anything else is a
+/// policy error at load time, so a typo can't silently fail every call.
+pub(crate) const FACT_FIELDS: &[&str] = &["root", "tainted", "taint_sources", "session"];
+
+/// Everything one decision is made from.
+#[derive(Debug, Clone, Copy)]
+pub struct DecisionContext<'a> {
+    pub tool: &'a str,
+    pub args: &'a Value,
+    pub facts: &'a Facts,
+}
+
+impl<'a> DecisionContext<'a> {
+    pub fn new(tool: &'a str, args: &'a Value, facts: &'a Facts) -> Self {
+        DecisionContext { tool, args, facts }
+    }
+}
+
+/// The values conditions resolve paths against: `args` and `writ`.
+pub(crate) struct Scope<'a> {
+    args: &'a Value,
+    writ: Value,
+}
+
+impl<'a> Scope<'a> {
+    pub(crate) fn new(ctx: &DecisionContext<'a>) -> Self {
+        Scope {
+            args: ctx.args,
+            writ: serde_json::to_value(ctx.facts).expect("facts serialize"),
+        }
+    }
+
+    /// Resolves a path whose first segment is `args` or `writ`.
+    pub(crate) fn get(&self, path: &[String]) -> Option<&Value> {
+        let (first, rest) = path.split_first()?;
+        let mut current = match first.as_str() {
+            "args" => self.args,
+            "writ" => &self.writ,
+            _ => return None,
+        };
+        for segment in rest {
+            current = match current {
+                Value::Object(map) => map.get(segment),
+                Value::Array(items) => segment.parse::<usize>().ok().and_then(|i| items.get(i)),
+                _ => None,
+            }?;
+        }
+        Some(current)
+    }
+}

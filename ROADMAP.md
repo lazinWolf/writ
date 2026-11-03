@@ -88,11 +88,13 @@ Each item is sized to be one PR. Start at the top.
 
 ### Step 2: Give decisions a context (blocker 1, about 2–3 days)
 
-- [ ] In `writ-policy`, add `pub struct DecisionContext { tool, args, session: SessionFacts, task: TaskFacts }`. `TaskFacts` holds `root` (principal, attributes), `tainted`, and `taint_sources`. Keep it a plain serializable struct: it's also the future Cedar/OPA export (OBSERVATIONS §3.4, D8).
-- [ ] Change `Policy::evaluate(&self, ctx: &DecisionContext)`, and make `Engine::decide` build the context from the task and session. This is a pure refactor: all 42 tests stay green.
-- [ ] Extend `Condition` to accept `writ.*` paths on the left-hand side (`writ.tainted`, `writ.root.principal`, `writ.session.name`), keeping fail-closed behaviour for missing paths.
-- [ ] Allow a path on the right-hand side (`args.amount <= writ.root.refund_limit`) and add the `in` operator (`args.customer in writ.root.entitled_customers`).
-- [ ] Record the context's *facts* (not the arguments, which are already redacted) in each `tool_call` entry, so `writ log` shows why a call was decided the way it was.
+- [x] In `writ-policy`, add `pub struct DecisionContext { tool, args, session: SessionFacts, task: TaskFacts }`. `TaskFacts` holds `root` (principal, attributes), `tainted`, and `taint_sources`. Keep it a plain serializable struct: it's also the future Cedar/OPA export (OBSERVATIONS §3.4, D8).
+- [x] Change `Policy::evaluate(&self, ctx: &DecisionContext)`, and make `Engine::decide` build the context from the task and session. This is a pure refactor: all 42 tests stay green.
+- [x] Extend `Condition` to accept `writ.*` paths on the left-hand side (`writ.tainted`, `writ.root.principal`, `writ.session.name`), keeping fail-closed behaviour for missing paths.
+- [x] Allow a path on the right-hand side (`args.amount <= writ.root.refund_limit`) and add the `in` operator (`args.customer in writ.root.entitled_customers`).
+- [x] Record the context's *facts* (not the arguments, which are already redacted) in each `tool_call` entry, so `writ log` shows why a call was decided the way it was.
+
+**Step 2 status:** done. `writ_policy::{DecisionContext, Facts, Root, SessionFacts}` live in `crates/writ-policy/src/context.rs`. Conditions read `args.*` and `writ.{root, tainted, taint_sources, session}.*`, an unknown `writ.*` field is a load error, and every `tool_call` log entry carries `facts`. Steps 3–5 now only have to *fill in* facts: the session name, taint, and the root and its entitlements.
 
 ### Step 3: Name sessions (blocker 3, about 1 day)
 

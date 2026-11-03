@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use writ_policy::{Decision, Outcome, Policy};
+use writ_policy::{Decision, DecisionContext, Facts, Outcome, Policy};
 use writ_recorder::{Recorder, RecorderError};
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +57,8 @@ pub struct Counters {
 
 struct Task {
     policy: LoadedPolicy,
+    /// What conditions see as `writ.*`, minus per-session facts.
+    facts: Facts,
     meta: Value,
     started_ms: u64,
     counters: Counters,
@@ -119,6 +121,7 @@ impl Engine {
             id.clone(),
             Task {
                 policy,
+                facts: Facts::default(),
                 meta,
                 started_ms: now_ms(),
                 counters: Counters::default(),
@@ -219,6 +222,9 @@ impl Engine {
             .get(&session.task)
             .expect("sessions always reference a live task");
 
+        // Facts are computed here, by writd, never taken from the agent or the server.
+        let facts = task.facts.clone();
+        let ctx = DecisionContext::new(tool, args, &facts);
         let mut decision = if task.ended {
             Decision {
                 outcome: Outcome::Deny,
@@ -226,11 +232,11 @@ impl Engine {
                 reason: format!("task `{}` has ended; its authority is revoked", session.task),
             }
         } else {
-            let from_task = task.policy.policy.evaluate(tool, args);
+            let from_task = task.policy.policy.evaluate(&ctx);
             match &session.policy {
                 // Ties keep the task's decision: the narrowing policy only matters when stricter.
                 Some(own) => {
-                    let from_session = own.policy.evaluate(tool, args);
+                    let from_session = own.policy.evaluate(&ctx);
                     if from_session.outcome > from_task.outcome {
                         Decision {
                             reason: format!("{} (session policy)", from_session.reason),
@@ -262,7 +268,13 @@ impl Engine {
             }
         }
 
-        let mut data = json!({ "id": call_id, "task": session.task, "tool": tool, "decision": decision });
+        let mut data = json!({
+            "id": call_id,
+            "task": session.task,
+            "tool": tool,
+            "decision": decision,
+            "facts": facts,
+        });
         // The narrowing policy's redaction applies on top of the task's; either can omit everything.
         let logged = task
             .policy
@@ -524,6 +536,20 @@ capabilities:
         assert_eq!(e.tasks().len(), 1);
         e.close_session(&s, json!({})).unwrap();
         assert!(e.tasks().is_empty(), "implicit task ends with its session");
+    }
+
+    #[test]
+    fn decisions_record_the_facts_they_saw() {
+        let (mut e, dir) = engine();
+        let task = e.create_task(policy(TASK_POLICY), json!({})).unwrap();
+        let s = e.open_session(Some(&task), None, json!({})).unwrap();
+        decide(&mut e, &s, "db.query", json!({}));
+
+        let log = writ_recorder::read_entries(dir.path().join("flight.jsonl")).unwrap();
+        let call = log.iter().find(|entry| entry.kind == "tool_call").unwrap();
+        assert_eq!(call.data["facts"]["tainted"], json!(false), "{}", call.data);
+        assert_eq!(call.data["facts"]["taint_sources"], json!([]));
+        assert!(call.data["facts"].get("root").is_none(), "no root principal yet");
     }
 
     #[test]

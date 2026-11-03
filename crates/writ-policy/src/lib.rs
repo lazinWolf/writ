@@ -1,7 +1,8 @@
 //! Parser and evaluator for `writ.yaml`.
 //!
 //! This build implements a subset of the spec in `plan-v2.md` §7.1: tool
-//! rules with argument conditions, and the `max_tool_calls` limit. Fields the
+//! rules with conditions over the call's arguments (`args.*`) and the task's
+//! facts (`writ.*`, see [`Facts`]), and the `max_tool_calls` limit. Fields the
 //! spec defines but this build does not enforce are rejected at load time, so
 //! a policy never appears to grant a guarantee it does not have.
 //!
@@ -10,6 +11,7 @@
 //! to tools no other rule matches, and a tool no rule matches is denied.
 
 mod condition;
+mod context;
 mod glob;
 mod redact;
 
@@ -19,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use condition::Condition;
+use context::Scope;
+pub use context::{DecisionContext, Facts, Root, SessionFacts};
 pub use redact::MARKER as REDACTED;
 use redact::RedactPath;
 
@@ -216,7 +220,8 @@ impl Policy {
     }
 
     /// Decides a single `tools/call`.
-    pub fn evaluate(&self, tool: &str, args: &Value) -> Decision {
+    pub fn evaluate(&self, ctx: &DecisionContext) -> Decision {
+        let tool = ctx.tool;
         let candidates = self.candidates(tool);
         if candidates.is_empty() {
             return Decision {
@@ -227,7 +232,8 @@ impl Policy {
         }
 
         let recording = Self::recording(&candidates);
-        let mut decisions = candidates.iter().map(|rule| rule.decide(args, &recording));
+        let scope = Scope::new(ctx);
+        let mut decisions = candidates.iter().map(|rule| rule.decide(&scope, &recording));
         let first = decisions.next().expect("candidates is non-empty");
         // `max_by_key` keeps the last maximum; fold keeps the first, so the
         // reported rule is the earliest of the most restrictive ones.
@@ -305,7 +311,7 @@ impl Rule {
         })
     }
 
-    fn decide(&self, args: &Value, recording: &Recording) -> Decision {
+    fn decide(&self, scope: &Scope, recording: &Recording) -> Decision {
         let rule = Some(self.pattern.clone());
         if self.action == Action::Deny {
             return Decision {
@@ -315,9 +321,9 @@ impl Rule {
             };
         }
         for condition in &self.conditions {
-            if let Err(reason) = condition.check(args) {
+            if let Err(reason) = condition.check(scope) {
                 // Decision reasons are recorded, so they must not echo a redacted value.
-                let reason = if recording.hides(condition.path()) {
+                let reason = if condition.arg_paths().any(|p| recording.hides(p)) {
                     format!("`{condition}` failed (value redacted)")
                 } else {
                     reason
@@ -379,6 +385,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    impl Policy {
+        /// Evaluates with no task facts, as for a task with no root and no taint.
+        fn eval(&self, tool: &str, args: &Value) -> Decision {
+            self.evaluate(&DecisionContext::new(tool, args, &Facts::default()))
+        }
+    }
+
     const POLICY: &str = r#"
 version: 1
 namespace: test
@@ -402,30 +415,30 @@ capabilities:
 
     #[test]
     fn allows_matching_rule() {
-        let d = policy().evaluate("postgres.query", &json!({}));
+        let d = policy().eval("postgres.query", &json!({}));
         assert_eq!(d.outcome, Outcome::Allow);
         assert_eq!(d.rule.as_deref(), Some("postgres.*"));
     }
 
     #[test]
     fn most_restrictive_matching_rule_wins() {
-        let d = policy().evaluate("postgres.drop_table", &json!({}));
+        let d = policy().eval("postgres.drop_table", &json!({}));
         assert_eq!(d.outcome, Outcome::Deny);
         assert_eq!(d.rule.as_deref(), Some("postgres.drop_table"));
     }
 
     #[test]
     fn fallback_applies_only_when_nothing_else_matches() {
-        assert_eq!(policy().evaluate("shell.exec", &json!({})).outcome, Outcome::Deny);
+        assert_eq!(policy().eval("shell.exec", &json!({})).outcome, Outcome::Deny);
         assert_eq!(
-            policy().evaluate("stripe.refund", &json!({"amount": 5})).outcome,
+            policy().eval("stripe.refund", &json!({"amount": 5})).outcome,
             Outcome::Allow
         );
     }
 
     #[test]
     fn condition_violation_requires_sudo() {
-        let d = policy().evaluate("stripe.refund", &json!({"amount": 240}));
+        let d = policy().eval("stripe.refund", &json!({"amount": 240}));
         assert_eq!(d.outcome, Outcome::RequireSudo);
         assert!(d.reason.contains("args.amount = 240"), "{}", d.reason);
     }
@@ -433,7 +446,7 @@ capabilities:
     #[test]
     fn deny_by_default_without_fallback() {
         let p = Policy::from_yaml_str("version: 1\nnamespace: t\ncapabilities:\n  - tool: a\n").unwrap();
-        let d = p.evaluate("b", &json!({}));
+        let d = p.eval("b", &json!({}));
         assert_eq!(d.outcome, Outcome::Deny);
         assert_eq!(d.rule, None);
         assert!(p.always_denies("b"));
@@ -505,7 +518,7 @@ capabilities:
     #[test]
     fn decision_reasons_do_not_echo_redacted_values() {
         let p = Policy::from_yaml_str(REDACTING).unwrap();
-        let d = p.evaluate("stripe.charge", &json!({"card": {"number": "1111"}}));
+        let d = p.eval("stripe.charge", &json!({"card": {"number": "1111"}}));
         assert_eq!(d.outcome, Outcome::Deny);
         assert!(
             !d.reason.contains("1111") && d.reason.contains("redacted"),
@@ -513,8 +526,67 @@ capabilities:
             d.reason
         );
 
-        let d = p.evaluate("vault.read", &json!({"path": "/secret/prod"}));
+        let d = p.eval("vault.read", &json!({"path": "/secret/prod"}));
         assert!(!d.reason.contains("/secret/prod"), "{}", d.reason);
+    }
+
+    #[test]
+    fn conditions_see_task_facts() {
+        let p = Policy::from_yaml_str(
+            r#"
+version: 1
+namespace: t
+capabilities:
+  - tool: "stripe.refund"
+    conditions:
+      - "writ.tainted == false"
+      - "args.customer in writ.root.entitled_customers"
+    on_violation: require_sudo
+"#,
+        )
+        .unwrap();
+        let args = json!({"customer": "cus_alice"});
+        let mut facts = Facts {
+            root: Some(Root {
+                principal: "alice".into(),
+                verified: false,
+                attributes: [("entitled_customers".to_string(), json!(["cus_alice"]))]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..Facts::default()
+        };
+        let decide = |facts: &Facts, args: &Value| p.evaluate(&DecisionContext::new("stripe.refund", args, facts));
+
+        assert_eq!(decide(&facts, &args).outcome, Outcome::Allow);
+        assert_eq!(
+            decide(&facts, &json!({"customer": "cus_bob"})).outcome,
+            Outcome::RequireSudo
+        );
+        facts.tainted = true;
+        let d = decide(&facts, &args);
+        assert_eq!(d.outcome, Outcome::RequireSudo);
+        assert!(d.reason.contains("writ.tainted = true"), "{}", d.reason);
+        // Without a root, conditions on it fail closed.
+        assert_eq!(decide(&Facts::default(), &args).outcome, Outcome::RequireSudo);
+    }
+
+    #[test]
+    fn redacted_values_stay_out_of_reasons_on_either_side() {
+        let p = Policy::from_yaml_str(
+            r#"
+version: 1
+namespace: t
+capabilities:
+  - tool: "x"
+    redact: ["args.secret"]
+    conditions: ["args.limit >= args.secret"]
+"#,
+        )
+        .unwrap();
+        let d = p.eval("x", &json!({"limit": 1, "secret": 4242}));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(!d.reason.contains("4242"), "{}", d.reason);
     }
 
     #[test]
@@ -525,7 +597,7 @@ capabilities:
             "version: 1\nnamespace: t\ntypo: 1\n",
             "version: 1\nnamespace: t\ncapabilities:\n  - tool: \"*\"\n  - tool: \"*\"\n",
             "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    action: deny\n    conditions: [\"args.a == 1\"]\n",
-            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    conditions: [\"writ.tainted == false\"]\n",
+            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    conditions: [\"writ.taint == false\"]\n",
         ] {
             assert!(Policy::from_yaml_str(yaml).is_err(), "accepted: {yaml}");
         }

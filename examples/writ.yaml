@@ -1,6 +1,6 @@
 # Example policy for `writ wrap` (cooperative mode).
 #
-# This build enforces tool rules, argument conditions, and max_tool_calls.
+# This build enforces tool rules, conditions (args.* and writ.* facts), and max_tool_calls.
 # Other writ.yaml fields from plan-v2.md §7.1 (data_flow, entitlements,
 # max_depth, ...) are rejected at load time until they are enforced.
 #

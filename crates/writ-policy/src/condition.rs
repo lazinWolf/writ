@@ -1,4 +1,12 @@
-//! Argument conditions: `args.<path> <op> <json-literal>`.
+//! Conditions: `<path> <op> <operand>`.
+//!
+//! - A path starts with `args.` (the call's arguments) or `writ.` (facts about
+//!   the task, see [`crate::Facts`]): `args.amount`, `writ.root.principal`.
+//! - `op` is one of `<`, `<=`, `>`, `>=`, `==`, `!=`, or `in`.
+//! - The operand is a JSON literal (`100.00`, `"usd"`, `true`, `null`; an
+//!   array only after `in`) or another path:
+//!   `args.amount <= writ.root.refund_limit`,
+//!   `args.customer in writ.root.entitled_customers`.
 //!
 //! Evaluation fails closed: a missing path or a type mismatch makes the
 //! condition fail rather than pass.
@@ -8,6 +16,8 @@ use std::fmt;
 
 use serde_json::Value;
 
+use crate::context::{FACT_FIELDS, Scope};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Lt,
@@ -16,6 +26,7 @@ pub enum Op {
     Ge,
     Eq,
     Ne,
+    In,
 }
 
 impl Op {
@@ -27,15 +38,26 @@ impl Op {
             Op::Ge => ">=",
             Op::Eq => "==",
             Op::Ne => "!=",
+            Op::In => "in",
         }
+    }
+
+    fn is_ordering(self) -> bool {
+        matches!(self, Op::Lt | Op::Le | Op::Gt | Op::Ge)
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
+enum Operand {
+    Literal(Value),
+    Path(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Condition {
-    path: Vec<String>,
+    lhs: Vec<String>,
     op: Op,
-    literal: Value,
+    rhs: Operand,
     source: String,
 }
 
@@ -45,111 +67,200 @@ impl fmt::Display for Condition {
     }
 }
 
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+/// Parses a path at the start of `s`. Returns it and the rest of `s`, or
+/// `None` if `s` doesn't start with `args.` or `writ.`.
+fn parse_path(s: &str) -> Option<Result<(Vec<String>, &str), String>> {
+    if !(s.starts_with("args.") || s.starts_with("writ.")) {
+        return None;
+    }
+    let end = s.find(|c: char| !is_path_char(c)).unwrap_or(s.len());
+    let text = &s[..end];
+    let path: Vec<String> = text.split('.').map(str::to_string).collect();
+    if path.iter().any(String::is_empty) {
+        return Some(Err(format!("invalid path `{text}`")));
+    }
+    if path[0] == "writ" && !FACT_FIELDS.contains(&path[1].as_str()) {
+        return Some(Err(format!(
+            "unknown fact `{text}` (known: {})",
+            FACT_FIELDS
+                .iter()
+                .map(|f| format!("writ.{f}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Some(Ok((path, &s[end..])))
+}
+
 impl Condition {
     pub fn parse(source: &str) -> Result<Self, String> {
         let s = source.trim();
-        let rest = s.strip_prefix("args.").ok_or_else(|| {
-            "conditions must start with `args.` (writ.* and other context fields are not supported yet)".to_string()
-        })?;
+        let (lhs, rest) =
+            parse_path(s).ok_or_else(|| "a condition must start with an `args.` or `writ.` path".to_string())??;
 
-        let path_end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
-            .unwrap_or(rest.len());
-        let path: Vec<String> = rest[..path_end].split('.').map(str::to_string).collect();
-        if path.iter().any(String::is_empty) {
-            return Err(format!("invalid argument path `args.{}`", &rest[..path_end]));
-        }
-
-        let rest = rest[path_end..].trim_start();
-        let (op, rest) = [
+        let rest = rest.trim_start();
+        let symbols = [
             ("<=", Op::Le),
             (">=", Op::Ge),
             ("==", Op::Eq),
             ("!=", Op::Ne),
             ("<", Op::Lt),
             (">", Op::Gt),
-        ]
-        .iter()
-        .find_map(|(sym, op)| rest.strip_prefix(sym).map(|r| (*op, r)))
-        .ok_or_else(|| "expected one of <, <=, >, >=, ==, != after the argument path".to_string())?;
+        ];
+        let (op, rest) = symbols
+            .iter()
+            .find_map(|(sym, op)| rest.strip_prefix(sym).map(|r| (*op, r)))
+            .or_else(|| {
+                rest.strip_prefix("in")
+                    .filter(|r| r.starts_with(char::is_whitespace))
+                    .map(|r| (Op::In, r))
+            })
+            .ok_or_else(|| "expected one of <, <=, >, >=, ==, !=, in after the path".to_string())?;
 
-        let literal: Value = serde_json::from_str(rest.trim()).map_err(|_| {
-            format!(
-                "right-hand side `{}` is not a JSON literal (use \"quoted\" strings)",
-                rest.trim()
-            )
-        })?;
-        if literal.is_array() || literal.is_object() {
-            return Err("right-hand side must be a number, string, boolean, or null".to_string());
-        }
-        if matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge) && !literal.is_number() {
-            return Err(format!("`{}` needs a numeric right-hand side", op.symbol()));
-        }
+        let rest = rest.trim();
+        let rhs = match parse_path(rest) {
+            Some(parsed) => {
+                let (path, trailing) = parsed?;
+                if !trailing.trim().is_empty() {
+                    return Err(format!("unexpected `{}` after the right-hand path", trailing.trim()));
+                }
+                Operand::Path(path)
+            }
+            None => {
+                let literal: Value = serde_json::from_str(rest).map_err(|_| {
+                    format!("right-hand side `{rest}` is not a path or a JSON literal (use \"quoted\" strings)")
+                })?;
+                match (op, &literal) {
+                    (Op::In, Value::Array(items)) if items.iter().all(is_scalar) => {}
+                    (Op::In, _) => return Err("`in` needs an array of scalars or a path".to_string()),
+                    (_, v) if !is_scalar(v) => {
+                        return Err("right-hand side must be a number, string, boolean, or null".to_string());
+                    }
+                    (op, v) if op.is_ordering() && !v.is_number() => {
+                        return Err(format!("`{}` needs a numeric right-hand side", op.symbol()));
+                    }
+                    _ => {}
+                }
+                Operand::Literal(literal)
+            }
+        };
 
         Ok(Condition {
-            path,
+            lhs,
             op,
-            literal,
+            rhs,
             source: s.to_string(),
         })
     }
 
-    pub(crate) fn path(&self) -> &[String] {
-        &self.path
+    /// The argument paths this condition reads, without the `args` prefix.
+    /// Used to keep redacted values out of decision reasons.
+    pub(crate) fn arg_paths(&self) -> impl Iterator<Item = &[String]> {
+        let rhs = match &self.rhs {
+            Operand::Path(p) => Some(p),
+            Operand::Literal(_) => None,
+        };
+        std::iter::once(&self.lhs)
+            .chain(rhs)
+            .filter(|p| p[0] == "args")
+            .map(|p| &p[1..])
     }
 
     /// Returns `Err(reason)` when the condition does not hold.
-    pub fn check(&self, args: &Value) -> Result<(), String> {
-        let mut current = args;
-        for segment in &self.path {
-            current = match current {
-                Value::Object(map) => map.get(segment),
-                Value::Array(items) => segment.parse::<usize>().ok().and_then(|i| items.get(i)),
-                _ => None,
-            }
-            .ok_or_else(|| format!("`{self}` failed: args.{} is missing", self.path.join(".")))?;
-        }
-
-        let holds = match (current, &self.literal) {
-            (Value::Number(a), Value::Number(b)) => match (a.as_f64(), b.as_f64()) {
-                (Some(a), Some(b)) => a.partial_cmp(&b).is_some_and(|ord| self.op_holds(ord)),
-                _ => false,
-            },
-            (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b) => match self.op {
-                Op::Eq => a == b,
-                Op::Ne => a != b,
-                _ => false,
-            },
-            // Type mismatch: fail closed for every operator, including `!=`.
-            _ => false,
+    pub(crate) fn check(&self, scope: &Scope) -> Result<(), String> {
+        let missing = |path: &[String]| format!("`{self}` failed: {} is missing", path.join("."));
+        let left = scope.get(&self.lhs).ok_or_else(|| missing(&self.lhs))?;
+        let right = match &self.rhs {
+            Operand::Literal(v) => v,
+            Operand::Path(p) => scope.get(p).ok_or_else(|| missing(p))?,
         };
 
+        let holds = match self.op {
+            Op::In => {
+                is_scalar(left)
+                    && right
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|i| equal(left, i)))
+            }
+            Op::Eq => equal(left, right),
+            // Type mismatch fails even for `!=`.
+            Op::Ne => same_scalar_type(left, right) && !equal(left, right),
+            op => numeric_order(left, right).is_some_and(|ord| op_holds(op, ord)),
+        };
         if holds {
-            Ok(())
-        } else {
-            Err(format!("`{self}` failed: args.{} = {current}", self.path.join(".")))
+            return Ok(());
         }
+        let mut reason = format!("`{self}` failed: {} = {left}", self.lhs.join("."));
+        if let Operand::Path(p) = &self.rhs {
+            reason.push_str(&format!(", {} = {right}", p.join(".")));
+        }
+        Err(reason)
     }
+}
 
-    fn op_holds(&self, ord: Ordering) -> bool {
-        match self.op {
-            Op::Lt => ord == Ordering::Less,
-            Op::Le => ord != Ordering::Greater,
-            Op::Gt => ord == Ordering::Greater,
-            Op::Ge => ord != Ordering::Less,
-            Op::Eq => ord == Ordering::Equal,
-            Op::Ne => ord != Ordering::Equal,
-        }
+fn is_scalar(v: &Value) -> bool {
+    !(v.is_array() || v.is_object())
+}
+
+/// Orders two numbers; anything else is incomparable, so the condition fails.
+fn numeric_order(a: &Value, b: &Value) -> Option<Ordering> {
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
+}
+
+fn same_scalar_type(a: &Value, b: &Value) -> bool {
+    is_scalar(a) && std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// Numbers are equal by value (`1 == 1.0`); other scalars only to a value of
+/// the same type. Arrays and objects are never equal to anything.
+fn equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(_), Value::Number(_)) => numeric_order(a, b) == Some(Ordering::Equal),
+        _ => same_scalar_type(a, b) && a == b,
+    }
+}
+
+fn op_holds(op: Op, ord: Ordering) -> bool {
+    match op {
+        Op::Lt => ord == Ordering::Less,
+        Op::Le => ord != Ordering::Greater,
+        Op::Gt => ord == Ordering::Greater,
+        Op::Ge => ord != Ordering::Less,
+        Op::Eq | Op::Ne | Op::In => unreachable!("not an ordering"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DecisionContext, Facts, Root};
     use serde_json::json;
 
+    fn check_with(expr: &str, args: Value, facts: &Facts) -> Result<(), String> {
+        let ctx = DecisionContext::new("t", &args, facts);
+        Condition::parse(expr).unwrap().check(&Scope::new(&ctx))
+    }
+
     fn check(expr: &str, args: Value) -> Result<(), String> {
-        Condition::parse(expr).unwrap().check(&args)
+        check_with(expr, args, &Facts::default())
+    }
+
+    fn alice() -> Facts {
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("entitled_customers".into(), json!(["cus_alice", "cus_alice_2"]));
+        attributes.insert("refund_limit".into(), json!(100));
+        Facts {
+            root: Some(Root {
+                principal: "alice@example.com".into(),
+                verified: false,
+                attributes,
+            }),
+            ..Facts::default()
+        }
     }
 
     #[test]
@@ -174,14 +285,72 @@ mod tests {
         assert!(check("args.amount <= 100", json!({"amount": "50"})).is_err());
         // Type mismatch fails even for `!=`.
         assert!(check("args.env != \"prod\"", json!({"env": 1})).is_err());
+        // Objects never compare, not even to themselves.
+        assert!(check("args.a == args.a", json!({"a": {}})).is_err());
+    }
+
+    #[test]
+    fn reads_task_facts() {
+        assert!(check("writ.tainted == false", json!({})).is_ok());
+        let tainted = Facts {
+            tainted: true,
+            ..Facts::default()
+        };
+        assert!(check_with("writ.tainted == false", json!({}), &tainted).is_err());
+        assert!(check_with("writ.root.principal == \"alice@example.com\"", json!({}), &alice()).is_ok());
+        assert!(check_with("writ.root.verified == true", json!({}), &alice()).is_err());
+        // No root: every condition that reads it fails.
+        let no_root = check("writ.root.principal != \"mallory\"", json!({}));
+        assert!(no_root.unwrap_err().contains("writ.root.principal is missing"));
+    }
+
+    #[test]
+    fn right_hand_paths() {
+        let facts = alice();
+        assert!(check_with("args.amount <= writ.root.refund_limit", json!({"amount": 40}), &facts).is_ok());
+        let err = check_with("args.amount <= writ.root.refund_limit", json!({"amount": 240}), &facts).unwrap_err();
+        assert!(
+            err.contains("args.amount = 240") && err.contains("writ.root.refund_limit = 100"),
+            "{err}"
+        );
+        assert!(check("args.a == args.b", json!({"a": 1, "b": 1.0})).is_ok());
+        assert!(check("args.a <= args.missing", json!({"a": 1})).is_err());
+        // Ordering needs numbers on both sides, even when the right side is a path.
+        assert!(check("args.a < args.b", json!({"a": "x", "b": "y"})).is_err());
+        assert!(check("args.a != args.b", json!({"a": "x", "b": 1})).is_err());
+    }
+
+    #[test]
+    fn membership() {
+        let facts = alice();
+        let entitled = "args.customer in writ.root.entitled_customers";
+        assert!(check_with(entitled, json!({"customer": "cus_alice"}), &facts).is_ok());
+        assert!(check_with(entitled, json!({"customer": "cus_bob"}), &facts).is_err());
+        // Not a scalar, or not a list: fail closed.
+        assert!(check_with(entitled, json!({"customer": ["cus_alice"]}), &facts).is_err());
+        assert!(check_with("args.c in writ.root.principal", json!({"c": "a"}), &facts).is_err());
+        assert!(check("args.cur in [\"usd\", \"eur\"]", json!({"cur": "eur"})).is_ok());
+        assert!(check("args.n in [1, 2]", json!({"n": 2.0})).is_ok());
+        assert!(check("args.cur in [\"usd\"]", json!({"cur": "gbp"})).is_err());
     }
 
     #[test]
     fn parse_errors() {
-        assert!(Condition::parse("writ.tainted == false").is_err());
-        assert!(Condition::parse("args.amount ~ 3").is_err());
-        assert!(Condition::parse("args.name == bob").is_err());
-        assert!(Condition::parse("args.name < \"bob\"").is_err());
-        assert!(Condition::parse("args..x == 1").is_err());
+        for bad in [
+            "charge.customer == 1",
+            "writ.bogus == false",
+            "writ. == 1",
+            "args.amount ~ 3",
+            "args.name == bob",
+            "args.name < \"bob\"",
+            "args..x == 1",
+            "args.a in 3",
+            "args.a in [[1]]",
+            "args.a == [1]",
+            "args.a == args.b extra",
+            "args.a inx [1]",
+        ] {
+            assert!(Condition::parse(bad).is_err(), "accepted: {bad}");
+        }
     }
 }

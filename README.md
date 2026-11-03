@@ -38,7 +38,7 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 
 ## What is enforced
 
-- **Tool rules** from `writ.yaml`: glob patterns, `allow`/`deny`, and argument conditions (`args.amount <= 100.00`). Every matching rule is evaluated and the most restrictive outcome wins (D9). `tool: "*"` applies only to tools no other rule matches. A tool no rule matches is denied.
+- **Tool rules** from `writ.yaml`: glob patterns, `allow`/`deny`, and conditions over the call's arguments and the task's facts: `args.amount <= 100.00`, `args.customer in writ.root.entitled_customers`, `writ.tainted == false`. Facts are computed by writ, never supplied by the agent or server, and are recorded with every decision. In this build no task has a root principal or taint yet (they arrive with the demo, see `ROADMAP.md`), so `writ.tainted` is always `false` and any condition reading `writ.root.*` fails closed. Every matching rule is evaluated and the most restrictive outcome wins (D9). `tool: "*"` applies only to tools no other rule matches. A tool no rule matches is denied.
 - **`limits.max_tool_calls`**, per task, and also per session when a narrowing policy sets it.
 - **`on_violation: require_sudo`** is recognized, but there's no approval broker yet, so those calls are refused with an explanation.
 - **Flight recorder:** every decision is written to a hash-chained JSONL log before the call is forwarded, and an **allowed** decision reaches stable storage (fdatasync) first. Denials are written but not synced individually, so a flood of denied calls can't force a sync per call; the next sync persists them. If a decision can't be recorded, the call is denied. Use `--no-fsync` (on `writ wrap` or `writd`) to trade crash durability for latency.
