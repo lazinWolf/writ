@@ -4,6 +4,35 @@ Policy and lineage layer for agent tool calls. See `plan-v2.md` for the full pla
 
 This is cooperative-mode work: `writ wrap` (a stdio MCP proxy), `writd` (the local daemon that owns tasks and decisions), `writ run` (start an agent as a task), `writ fork` (narrow a task for a sub-agent), `writ ps`, `writ sudo` (decide calls waiting for a human), and `writ replay`. The poisoned-ticket demo in `examples/poisoned-ticket` runs end to end.
 
+## Quick start: Claude Code
+
+```sh
+cd my-project
+writ init          # starter writ.yaml (observe mode) + writ's hook in .claude/settings.json
+claude             # work as usual
+writ report        # what writ saw, and what it would have stopped
+```
+
+`writ hook claude-code` sees **every** Claude Code tool call, not just MCP:
+
+| Claude Code tool | writ tool | source |
+|---|---|---|
+| Bash | `shell.exec` (`args.command`, `args.argv`) | `shell` |
+| Read / Write, Edit, NotebookEdit / Glob, Grep | `fs.read` / `fs.write` / `fs.search` (`args.path`, absolute) | `fs` |
+| WebFetch, WebSearch | `web.fetch` (`args.url`, `args.host`), `web.search` | `web` |
+| Task (sub-agents) | `agent.spawn` | `agent` |
+| `mcp__github__create_pull_request` | `github.create_pull_request` | `mcp:github` |
+| anything else | `claude.<Tool>` | `claude` |
+
+Calls in one Claude Code session share a writ task in writd (started on first use), so taint carries across calls. The starter policy:
+- **protects agent configuration:** it denies writes to `.mcp.json`, Claude/Cursor/VS Code settings and `writ.yaml`, and asks before shell commands that touch them or before edits to `CLAUDE.md`/`AGENTS.md`;
+- **asks before destructive commands** (`terraform destroy`, `git push --force`, `kubectl delete`, `DROP TABLE`, …) and writes outside the project;
+- **treats the web as untrusted:** after a WebFetch, every shell command, file write and MCP call needs your OK.
+
+writ only narrows Claude Code: an allowed call gets no answer from the hook, so Claude Code's own permission settings still apply; `require_sudo` becomes Claude Code's "ask" prompt; `deny` blocks with writ's reason. If writ can't decide (no policy, a broken policy, writd unreachable), the call is denied, with the fix in the message. `writ init --undo` removes the hook. It also wraps the stdio servers in `.cursor/mcp.json` with `writ wrap`.
+
+**Observe first.** With `mode: observe`, nothing is blocked: every decision is recorded with what the policy *would* have done (`"would": "deny"`), and `writ report` lists those calls along with untrusted reads and privileged calls that followed them. When the report looks right, set `mode: enforce`. Revocation (an ended task, an expired token) is enforced even in observe mode.
+
 ## Tasks: authority belongs to the task, not the server
 
 ```sh
@@ -53,7 +82,7 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 
 ## What is enforced
 
-- **Tool rules** from `writ.yaml`: glob patterns, `allow`/`deny`, and conditions over the call's arguments and the task's facts: `args.amount <= 100.00`, `args.customer in writ.root.entitled_customers`, `writ.tainted == false`. Facts are computed by writ, never supplied by the agent or server, and are recorded with every decision. In this build no task has a root principal or taint yet (they arrive with the demo, see `ROADMAP.md`), so `writ.tainted` is always `false` and any condition reading `writ.root.*` fails closed. Every matching rule is evaluated and the most restrictive outcome wins (D9). `tool: "*"` applies only to tools no other rule matches. A tool no rule matches is denied.
+- **Tool rules** from `writ.yaml`: glob patterns, `allow`/`deny`, and conditions over the call's arguments and the task's facts: `args.amount <= 100.00`, `args.customer in writ.root.entitled_customers`, `writ.tainted == false`, `args.command not matches ["terraform destroy*", "*rm -rf /*"]` (globs; on a list, any element), `args.path within writ.workspace` (lexical, `..` resolved). A rule's `reason: "..."` leads the explanation when it refuses or escalates a call. Facts are computed by writ, never supplied by the agent or server, and are recorded with every decision. In this build no task has a root principal or taint yet (they arrive with the demo, see `ROADMAP.md`), so `writ.tainted` is always `false` and any condition reading `writ.root.*` fails closed. Every matching rule is evaluated and the most restrictive outcome wins (D9). `tool: "*"` applies only to tools no other rule matches. A tool no rule matches is denied.
 - **Server names:** `writ wrap --name zendesk` makes the session `mcp:zendesk`, the name policies match in `data_flow.untrusted_sources` and see as `writ.session.name`. Without `--name`, writ derives one from the command (`npx -y @scope/server-postgres` → `mcp:server-postgres`) and warns. Name servers explicitly whenever a policy refers to them.
 - **Taint (coarse, per task):** list servers whose content may be attacker-written in `data_flow.untrusted_sources: ["mcp:zendesk"]`. The first **allowed** call to one of them taints the whole task, across all its servers, before the call is forwarded. Denied calls don't taint, and taint is never cleared. On a tainted task, a tool whose rule says `privileged: true` gets `data_flow.on_taint.privileged_mutations` (`require_sudo` by default, or `deny`); other tools are unaffected. The flight log records a `taint` event, every decision records the facts it saw, and `writ ps` shows a TAINTED column. Either the task's policy or a narrowing policy can declare a source untrusted.
 - **Entitlements (who the task acts for):** `writ run --principal alice@example.com` gives the task a root principal, recorded as **unverified** (it's asserted by whoever runs the command, until roots are minted from an identity proof). The policy names an entitlement source, `entitlements: {source: file, path: entitlements.yaml}` (a mock; the path is relative to the policy). Its `principals.<id>` become `writ.root.*`. A rule can `lookup:` a record, such as `charge: {table: charges, key: args.charge}`, and state `entitlements:`, such as `charge.customer in writ.root.entitled_customers` and `args.amount <= charge.amount`. A call that breaks one gets `on_entitlement_violation` (`deny` by default), whatever else applies. A call whose entitlements all hold is **covered**: it's within the root's own authority, so taint doesn't add an approval requirement. Unknown principals, unknown records and a missing source all fail closed. Both files are read once when the task starts, and their hashes are recorded. A narrowing policy can't bring its own source.

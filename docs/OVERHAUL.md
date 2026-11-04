@@ -154,12 +154,12 @@ Each phase ends with something demoable and a measurable exit condition.
 
 ### Phase A: "Works on my laptop in five minutes" (about 4–6 weeks)
 The goal is developer adoption, focused on coding agents first.
-- [ ] Introduce the `Action` model and refactor the engine around it. MCP keeps working unchanged.
-- [ ] `writ hook claude-code`: a PreToolUse and PostToolUse adapter. It maps allow, deny and approve to the hook's `allow`, `deny` and `ask`, handles Bash, Write, Edit and WebFetch, and runs `writ fork` automatically on `Task`.
-- [ ] `writ init` and `writ init --undo`, for Claude Code, Claude Desktop and Cursor.
-- [ ] `mode: observe`, plus `writ report`.
-- [ ] Packs: `self-protect`, `destructive-shell`, `trifecta`, `github`.
-- [ ] Shell, path and URL matchers.
+- [x] Introduce the `Action` model (sources and tool names for hook calls; scoped tasks in writd for callers with no connection). MCP keeps working unchanged.
+- [x] `writ hook claude-code`: a PreToolUse and PostToolUse adapter. Allow becomes no answer, so Claude Code's own permissions still apply; deny and require_sudo become `deny` and `ask`. It covers Bash, file tools, the web and MCP tools. Verified against Claude Code 2.1.318. *Not done:* automatic `writ fork` on `Task`, because Claude Code sub-agents run in-process and share the session; their calls are recorded under `agent.spawn` for now.
+- [x] `writ init` and `writ init --undo`, for Claude Code (hook) and Cursor (`.cursor/mcp.json` wrapping). Claude Desktop's global config is still to do.
+- [x] `mode: observe` (policy-level; per-rule modes are still to do), plus `writ report`.
+- [x] Packs: `self-protect`, `destructive-shell` and `trifecta`, built into the starter policy. *Not done:* `github`, and packs as separate files that can be included.
+- [x] Shell, path and URL matchers: `matches`, `not matches`, `within`, plus `args.argv` and `args.host`.
 - [ ] Tool-definition pinning.
 - [ ] Packaging: Homebrew, `cargo install`, prebuilt binaries for Linux and macOS (with the `getpeereid` peer check), and a 60-second demo video of the poisoned ticket and of `terraform destroy` being caught.
 - **Exit:** five outside developers run it for a week. At least three keep it on, and it catches at least one real trifecta moment or destructive command.
