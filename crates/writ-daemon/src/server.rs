@@ -144,6 +144,9 @@ impl Connection {
                     entitlements: entitlements.as_deref().map(LoadedEntitlements::parse).transpose()?,
                 };
                 let task = engine.create_task(LoadedPolicy::parse(&policy)?, authority, meta)?;
+                if let Some(pid) = self.peer_pid {
+                    engine.set_task_process(&task, pid);
+                }
                 self.tasks.push(task.clone());
                 Ok(json!({ "task": task }))
             }
@@ -170,6 +173,9 @@ impl Connection {
                     &name,
                     info,
                 )?;
+                if let Some(pid) = self.peer_pid {
+                    engine.set_session_process(&session, pid);
+                }
                 self.session = Some(session.clone());
                 Ok(json!({ "session": session }))
             }
@@ -191,6 +197,22 @@ impl Connection {
                 approve,
                 mut approver,
             } => {
+                // The agent (a descendant of `writ run`) and the wrapped servers (descendants
+                // of their `writ wrap`) must not decide their own task's approvals. A process
+                // that detaches from its parent escapes this check: it's a guard, not a
+                // boundary against same-user code.
+                if let Some(peer) = self.peer_pid
+                    && let Some(owner) = engine
+                        .approval_processes(&id)
+                        .into_iter()
+                        .find(|&owner| descends_from(peer, owner))
+                {
+                    return Err(EngineError::Invalid(format!(
+                        "refusing to decide approval `{id}`: the request comes from a process running under \
+                         that task (pid {peer} descends from pid {owner}). An agent or its servers must not \
+                         decide their own approvals; run `writ sudo` from your own shell."
+                    )));
+                }
                 // Who decided, as the kernel reports it, alongside what the client says.
                 if let Value::Object(map) = &mut approver {
                     map.insert("pid".into(), json!(self.peer_pid));
@@ -239,6 +261,35 @@ fn same_user_peer(stream: &UnixStream) -> Option<Option<i32>> {
     };
     // SAFETY: getuid has no preconditions.
     (rc == 0 && cred.uid == unsafe { libc::getuid() }).then_some(Some(cred.pid))
+}
+
+/// True when `pid` is `ancestor` or one of its descendants, following parent
+/// pids through `/proc`. A process that was reparented (it detached, or its
+/// parent died) no longer descends from its original ancestor.
+#[cfg(target_os = "linux")]
+fn descends_from(pid: i32, ancestor: i32) -> bool {
+    let parent = |pid: i32| -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `pid (comm) state ppid ...`; comm may contain spaces and parentheses.
+        let after_comm = &stat[stat.rfind(')')? + 1..];
+        after_comm.split_whitespace().nth(1)?.parse().ok()
+    };
+    let mut current = pid;
+    for _ in 0..256 {
+        if current == ancestor {
+            return true;
+        }
+        match parent(current) {
+            Some(p) if p > 0 && p != current => current = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn descends_from(_pid: i32, _ancestor: i32) -> bool {
+    false
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -305,6 +356,8 @@ pub fn run(socket: &Path, log: &Path, fsync: bool) -> anyhow::Result<()> {
                 let _ = fs::remove_file(&pid_path);
                 let mut engine = shared.engine.lock().unwrap();
                 let live = engine.tasks().len();
+                // Settle waiting calls first, so the log shows how each approval ended.
+                engine.cancel_all_approvals("writd stopped");
                 engine.note("writd_stop", json!({ "signal": signal, "live_tasks": live }));
                 // Exiting drops every connection: sessions lose their decision source and deny.
                 std::process::exit(0);

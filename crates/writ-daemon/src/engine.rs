@@ -130,6 +130,9 @@ struct Task {
     /// Created for a single standalone session; ends with it.
     implicit: bool,
     ended: bool,
+    /// The process that created the task (`writ run`), if known. It and its
+    /// descendants (the agent) must not decide the task's approvals.
+    creator_pid: Option<i32>,
 }
 
 /// A `require_sudo` call paused until a human decides, it times out, or its
@@ -185,6 +188,9 @@ struct Session {
     source: String,
     policy: Option<LoadedPolicy>,
     counters: Counters,
+    /// The `writ wrap` process serving this session, if known. It and its
+    /// descendants (the MCP server) must not decide the task's approvals.
+    pid: Option<i32>,
 }
 
 /// One row of `writ ps`.
@@ -294,9 +300,45 @@ impl Engine {
                 sessions: BTreeSet::new(),
                 implicit,
                 ended: false,
+                creator_pid: None,
             },
         );
         Ok(id)
+    }
+
+    /// Records the process that created `task`. It and its descendants (the
+    /// agent) can't decide the task's approvals; see [`Engine::approval_processes`].
+    pub fn set_task_process(&mut self, task: &str, pid: i32) {
+        if let Some(task) = self.tasks.get_mut(task) {
+            task.creator_pid = Some(pid);
+        }
+    }
+
+    /// Records the process serving `session` (its `writ wrap`).
+    pub fn set_session_process(&mut self, session: &str, pid: i32) {
+        if let Some(session) = self.sessions.get_mut(session) {
+            session.pid = Some(pid);
+        }
+    }
+
+    /// The processes acting for an approval's task: whoever created the task
+    /// and every wrapped server's proxy. A decision must not come from any of
+    /// them or their descendants, or an agent (or a malicious MCP server)
+    /// could approve its own calls.
+    pub fn approval_processes(&self, id: &str) -> Vec<i32> {
+        let Some(task) = self.approvals.get(id).and_then(|a| self.tasks.get(&a.task)) else {
+            return Vec::new();
+        };
+        task.creator_pid
+            .into_iter()
+            .chain(task.sessions.iter().filter_map(|s| self.sessions.get(s)?.pid))
+            .collect()
+    }
+
+    /// Denies every pending approval, recording `why`. writd calls this when
+    /// it stops, so the log shows how each one ended.
+    pub fn cancel_all_approvals(&mut self, why: &str) {
+        self.cancel_approvals(why, |_| true);
     }
 
     /// Ends a task. Its remaining sessions stay open but every later decision
@@ -391,6 +433,7 @@ impl Engine {
                 source,
                 policy: session_policy,
                 counters: Counters::default(),
+                pid: None,
             },
         );
         Ok(id)

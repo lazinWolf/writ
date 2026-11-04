@@ -121,6 +121,15 @@ fn paused_calls_wait_for_a_human_without_blocking_others() {
             .unwrap()
             .contains("inside a writ task")
     );
+    // Hiding WRIT_TASK doesn't help: writd sees the caller descends from the task's `writ run`.
+    assert_eq!(driver["self_approve_unset"]["code"], 2, "{driver}");
+    assert!(
+        driver["self_approve_unset"]["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("running under that task"),
+        "{driver}"
+    );
     let r = &driver["responses"];
     assert_eq!(r["1"]["result"]["isError"], json!(false), "approved refund: {}", r["1"]);
     assert!(text(&r["1"]).contains("executed stripe.refund"), "{}", r["1"]);
@@ -153,4 +162,83 @@ fn paused_calls_wait_for_a_human_without_blocking_others() {
         })
         .collect();
     assert_eq!(settled, [("approve", Some("writ sudo")), ("timeout", None)]);
+}
+
+/// Stopping writd while a call waits denies it, and the log says so.
+#[test]
+fn stopping_writd_settles_waiting_calls_in_the_log() {
+    if !has_python() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    std::fs::write(path("writ.yaml"), POLICY).unwrap();
+    let _stop = StopWritd(path("run/writd.sock"));
+    let writ = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
+        cmd.env("WRIT_SOCKET", path("run/writd.sock"))
+            .env("WRIT_LOG", path("flight.jsonl"))
+            .env_remove("WRIT_TASK");
+        cmd
+    };
+    let agent = writ()
+        .args(["run", "--policy"])
+        .arg(path("writ.yaml"))
+        .args(["--", "python3", "-I"])
+        .arg(fixture("approvals_agent.py"))
+        .env("WRIT_BIN", env!("CARGO_BIN_EXE_writ"))
+        .env("DRIVER_OUT", path("driver.json"))
+        .env("FAKE_MCP_LOG", path("server.log"))
+        .env("SKIP_TIMEOUT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let id = loop {
+        assert!(Instant::now() < deadline, "no approval became pending");
+        let out = writ().args(["sudo", "list", "--json"]).output().unwrap();
+        if let Ok(Value::Array(list)) = serde_json::from_slice::<Value>(&out.stdout)
+            && let Some(first) = list.first()
+        {
+            break first["id"].as_str().unwrap().to_string();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let pid = std::fs::read_to_string(path("run/writd.pid")).unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = agent.wait_with_output().unwrap();
+    let _ = out;
+
+    let driver: Value = serde_json::from_str(&std::fs::read_to_string(path("driver.json")).unwrap()).unwrap();
+    let refund = &driver["responses"]["1"];
+    assert_eq!(refund["result"]["isError"], json!(true), "{refund}");
+    let server_saw = std::fs::read_to_string(path("server.log")).unwrap_or_default();
+    assert!(!server_saw.contains("\"amount\":240"), "{server_saw}");
+
+    let log: Vec<Value> = std::fs::read_to_string(path("flight.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let settled = log
+        .iter()
+        .find(|e| e["kind"] == "approval" && e["data"]["approval"] == id.as_str())
+        .unwrap_or_else(|| panic!("no settlement recorded for {id}"));
+    assert_eq!(settled["data"]["decision"], "cancelled");
+    assert!(
+        settled["data"]["outcome"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("writd stopped"),
+        "{settled}"
+    );
 }

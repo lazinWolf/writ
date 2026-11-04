@@ -35,9 +35,15 @@ def read():
     return json.loads(proc.stdout.readline())
 
 
-def sudo(*args):
-    out = subprocess.run([WRIT, "sudo", *args], capture_output=True, text=True)
+def sudo(*args, env=None):
+    out = subprocess.run([WRIT, "sudo", *args], capture_output=True, text=True, env=env)
     return {"code": out.returncode, "stdout": out.stdout, "stderr": out.stderr}
+
+
+def without_task_env():
+    env = dict(os.environ)
+    env.pop("WRIT_TASK", None)
+    return env
 
 
 send(1, "stripe.refund", {"amount": 240})
@@ -53,6 +59,9 @@ while not pending and time.time() < deadline:
     pending = json.loads(listed["stdout"]) if listed["code"] == 0 else []
     time.sleep(0.05)
 self_approve = sudo("approve", pending[0]["id"]) if pending else {"code": None}
+# Hiding WRIT_TASK gets past the CLI's check; writd must still refuse, since we
+# descend from the task's `writ run`.
+self_approve_unset = sudo("approve", pending[0]["id"], env=without_task_env()) if pending else {"code": None}
 
 responses = {first["id"]: first}
 while 1 not in responses:
@@ -60,13 +69,16 @@ while 1 not in responses:
     order.append(message["id"])
     responses[message["id"]] = message
 
-send(3, "stripe.refund", {"amount": 300})
-started = time.time()
-responses[3] = read()
-waited = time.time() - started
+waited = None
+if os.environ.get("SKIP_TIMEOUT") != "1":
+    send(3, "stripe.refund", {"amount": 300})
+    started = time.time()
+    responses[3] = read()
+    waited = time.time() - started
 
 proc.stdin.close()
 exit_code = proc.wait(timeout=15)
 with open(os.environ["DRIVER_OUT"], "w") as f:
-    json.dump({"order": order, "self_approve": self_approve, "responses": responses,
+    json.dump({"order": order, "self_approve": self_approve, "self_approve_unset": self_approve_unset,
+               "responses": responses,
                "timeout_waited_s": waited, "exit": exit_code}, f)
