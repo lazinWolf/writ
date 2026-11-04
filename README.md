@@ -93,6 +93,23 @@ writ log --verify              # check the hash chain
 writ log --session tsk_… --json   # one task or session
 ```
 
+### Policy replay: review a policy change against real traffic
+
+```sh
+writ replay --policy new.yaml [--log …] [--task tsk_…] [--json]
+```
+
+Re-decides every recorded call under `new.yaml` and lists the calls whose outcome would change, with the old and new reasons, and whether a human approved or denied it at the time. It exits **1 if any call would be decided less restrictively** (deny → allow, deny → require_sudo, require_sudo → allow), so it can gate policy changes in CI, and 0 otherwise.
+
+```text
+    15  tsk_18e4ed…  stripe.add_credit {"amount":10,"customer":"cus_alice"}
+        REQUIRE_SUDO (then deny) -> ALLOW  LOOSER
+        was: `stripe.add_credit` is privileged and the task is tainted (it read from mcp:zendesk-tickets)
+        now: allowed by rule `stripe.add_credit`
+```
+
+Taint and `max_tool_calls` are re-simulated per task under the new policy. The root principal and server names come from the log, and lookups read the new policy's entitlement source as it is now. Calls whose arguments were redacted are flagged `partial` (a decision that reads them is a guess); calls with `record_arguments: false` can't be replayed and are counted as skipped. Narrowing (per-server) policies aren't replayed.
+
 Defaults:
 - **Log:** `$WRIT_LOG`, then `$XDG_STATE_HOME/writ/flight.jsonl`, then `~/.local/state/writ/flight.jsonl`.
 - **writd socket:** `$WRIT_SOCKET`, then `$XDG_RUNTIME_DIR/writ/writd.sock`. Its directory is created 0700, the socket is 0600, and peers must run as the same user.

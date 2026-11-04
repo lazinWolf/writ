@@ -9,6 +9,7 @@
 pub mod client;
 pub mod engine;
 pub mod protocol;
+pub mod replay;
 pub mod server;
 
 use std::path::PathBuf;

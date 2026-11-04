@@ -74,6 +74,24 @@ enum Commands {
     },
     /// Validate a writ.yaml without running anything.
     Check { policy: PathBuf },
+    /// Re-decide recorded calls under another policy and show what would change.
+    ///
+    /// Exits 1 if any call would be decided less restrictively (for example deny -> allow),
+    /// so it can gate policy changes in CI; 0 otherwise.
+    Replay {
+        /// The candidate writ.yaml.
+        #[arg(long)]
+        policy: PathBuf,
+        /// Flight recorder file [default: $WRIT_LOG or ~/.local/state/writ/flight.jsonl].
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Only replay calls from this task or session.
+        #[arg(long)]
+        task: Option<String>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or verify the flight recorder.
     Log {
         /// Flight recorder file [default: $WRIT_LOG or ~/.local/state/writ/flight.jsonl].
@@ -164,6 +182,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => run_task(&policy, principal.as_deref(), log.as_deref(), &command),
         Commands::Ps => ps(),
         Commands::Sudo { action } => sudo(action),
+        Commands::Replay {
+            policy,
+            log,
+            task,
+            json,
+        } => replay(&policy, log, task.as_deref(), json),
         Commands::Check { policy: path } => {
             let files = read_policy(&path)?;
             let parsed = Policy::from_yaml_str(&files.policy)?;
@@ -536,6 +560,97 @@ fn sudo(action: SudoAction) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+fn replay(policy_path: &Path, log: Option<PathBuf>, task: Option<&str>, json: bool) -> Result<ExitCode> {
+    let files = read_policy(policy_path)?;
+    let policy = Policy::from_yaml_str(&files.policy)?;
+    let entitlements = files
+        .entitlements
+        .as_deref()
+        .map(LoadedEntitlements::parse)
+        .transpose()?;
+    let log = log.unwrap_or_else(writ_recorder::default_log_path);
+    let entries = writ_recorder::read_entries(&log)?;
+    let report = writ_daemon::replay::replay(
+        &entries,
+        &policy,
+        entitlements.as_ref().map(|e| e.source.as_ref()),
+        task,
+    );
+    let code = if report.loosened() > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(code);
+    }
+
+    println!(
+        "replayed {} call{} from {} under {}: {} would change ({} looser, {} stricter)",
+        report.replayed,
+        if report.replayed == 1 { "" } else { "s" },
+        log.display(),
+        policy_path.display(),
+        report.flips.len(),
+        report.loosened(),
+        report.tightened(),
+    );
+    if report.skipped > 0 {
+        println!(
+            "  {} skipped: arguments not recorded (record_arguments: false)",
+            report.skipped
+        );
+    }
+    if report.partial > 0 {
+        println!(
+            "  {} partial: arguments partly redacted, so a decision that reads them is a guess",
+            report.partial
+        );
+    }
+    let outcome = |o: writ_policy::Outcome| s_outcome(o).to_uppercase();
+    for f in &report.flips {
+        let args = f.arguments.to_string();
+        let short: String = args.chars().take(80).collect();
+        println!();
+        println!(
+            "{:>6}  {}  {} {}{}",
+            f.seq,
+            f.task,
+            f.tool,
+            short,
+            if short.len() < args.len() { "…" } else { "" }
+        );
+        println!(
+            "        {}{} -> {}  {}{}",
+            outcome(f.before.outcome),
+            f.settled.as_deref().map_or(String::new(), |s| format!(" (then {s})")),
+            outcome(f.after.outcome),
+            if f.loosens() { "LOOSER" } else { "stricter" },
+            if f.partial { "  [partial]" } else { "" },
+        );
+        println!("        was: {}", f.before.reason);
+        println!("        now: {}", f.after.reason);
+    }
+    if report.loosened() > 0 {
+        println!();
+        println!(
+            "{} call(s) would be allowed more freely under {}",
+            report.loosened(),
+            policy_path.display()
+        );
+    }
+    Ok(code)
+}
+
+fn s_outcome(outcome: writ_policy::Outcome) -> &'static str {
+    match outcome {
+        writ_policy::Outcome::Allow => "allow",
+        writ_policy::Outcome::RequireSudo => "require_sudo",
+        writ_policy::Outcome::Deny => "deny",
     }
 }
 

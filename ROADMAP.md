@@ -142,9 +142,15 @@ Follow-ups found while testing:
 
 ### Step 7: Policy replay (about 2 days; can run in parallel with steps 2–6)
 
-- [ ] `writ replay --policy new.yaml [--log …] [--session …]` re-evaluates every recorded `tool_call` and prints the calls whose outcome would flip, with both reasons.
-- [ ] Warn when a recorded call's arguments were redacted or omitted, since its replay is then partial.
-- [ ] Exit non-zero when anything flips from deny to allow, so it can gate policy changes in CI.
+- [x] `writ replay --policy new.yaml [--log …] [--task …] [--json]` re-evaluates every recorded `tool_call` and prints the calls whose outcome would flip, with both reasons.
+- [x] Warn when a recorded call's arguments were redacted or omitted, since its replay is then partial.
+- [x] Exit non-zero when anything gets looser (deny → allow, deny → require_sudo, require_sudo → allow), so it can gate policy changes in CI.
+
+**Step 7 status:** done. The logic is `writ_daemon::replay` (unit-tested). Taint and `max_tool_calls` are re-simulated per task under the candidate, so adding an untrusted source changes only the calls after the first read. Checked against a real demo log: deleting `privileged: true` from `stripe.add_credit` is reported as letting the injected credit, which a human denied at the time, through.
+
+Follow-ups:
+- [ ] Replay narrowing (per-server) policies too, from their recorded hashes (needs the policy text stored, not just its hash).
+- [ ] Record lookup results with each decision, so replay uses what the source said then, not now.
 
 ### Step 8: Signed task tokens (after the demo, about 1–2 weeks)
 
