@@ -2,7 +2,7 @@
 
 Policy and lineage layer for agent tool calls. See `plan-v2.md` for the full plan and `OBSERVATIONS.md` for where things stand.
 
-This is Phase 0 work, in cooperative mode: `writ wrap` (a stdio MCP proxy), `writd` (the local daemon that owns tasks and decisions), `writ run` (start an agent as a task), and `writ ps`.
+This is cooperative-mode work: `writ wrap` (a stdio MCP proxy), `writd` (the local daemon that owns tasks and decisions), `writ run` (start an agent as a task), `writ ps`, and `writ sudo` (decide calls waiting for a human). The poisoned-ticket demo in `examples/poisoned-ticket` runs end to end.
 
 ## Tasks: authority belongs to the task, not the server
 
@@ -43,7 +43,18 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 - **Taint (coarse, per task):** list servers whose content may be attacker-written in `data_flow.untrusted_sources: ["mcp:zendesk"]`. The first **allowed** call to one of them taints the whole task, across all its servers, before the call is forwarded. Denied calls don't taint, and taint is never cleared. On a tainted task, a tool whose rule says `privileged: true` gets `data_flow.on_taint.privileged_mutations` (`require_sudo` by default, or `deny`); other tools are unaffected. The flight log records a `taint` event, every decision records the facts it saw, and `writ ps` shows a TAINTED column. Either the task's policy or a narrowing policy can declare a source untrusted.
 - **Entitlements (who the task acts for):** `writ run --principal alice@example.com` gives the task a root principal, recorded as **unverified** (it's asserted by whoever runs the command, until roots are minted from an identity proof). The policy names an entitlement source, `entitlements: {source: file, path: entitlements.yaml}` (a mock; the path is relative to the policy). Its `principals.<id>` become `writ.root.*`. A rule can `lookup:` a record, such as `charge: {table: charges, key: args.charge}`, and state `entitlements:`, such as `charge.customer in writ.root.entitled_customers` and `args.amount <= charge.amount`. A call that breaks one gets `on_entitlement_violation` (`deny` by default), whatever else applies. A call whose entitlements all hold is **covered**: it's within the root's own authority, so taint doesn't add an approval requirement. Unknown principals, unknown records and a missing source all fail closed. Both files are read once when the task starts, and their hashes are recorded. A narrowing policy can't bring its own source.
 - **`limits.max_tool_calls`**, per task, and also per session when a narrowing policy sets it.
-- **`on_violation: require_sudo`** is recognized, but there's no approval broker yet, so those calls are refused with an explanation.
+- **Approvals (`require_sudo`):** with an `approvals:` block in the task's policy (`approvals: {timeout: 15m}`; 15m is the default), a call that needs a human **pauses**. The agent gets no placeholder: its call simply hasn't returned yet, and other calls, on that server and others, keep flowing. writ prints the approval id on stderr. A human decides from their own shell:
+
+  ```sh
+  writ sudo list            # waiting calls, oldest first (--json for scripts)
+  writ sudo show apr_…      # tool, arguments (redacted per policy), principal, taint, why
+  writ sudo approve apr_…   # the call is re-checked, then forwarded; the agent gets the real result
+  writ sudo deny apr_…      # the agent gets a policy denial
+  ```
+
+  An approved call is re-checked first: if its task ended or a `max_tool_calls` limit was reached while it waited, it's still refused. No decision before the timeout means denial. Ending the task or closing the server also denies its waiting calls. Each settlement (`approve`, `deny`, `timeout`, `cancelled`) is recorded durably as an `approval` event with the approver (`$USER`, plus the pid and uid writd sees), and an approved call is forwarded only after that. A narrowing policy can shorten the timeout. Without an `approvals:` block, or in a standalone `writ wrap` (there's no writd to ask), `require_sudo` calls are refused with an explanation, as before.
+
+  **Approvals are not yet a boundary against the agent itself.** `writ sudo` refuses to run inside a writ task (`WRIT_TASK` set), so an agent can't casually approve its own calls, but any process running as the same user can reach writd directly. Signed approvals (passkeys) are planned.
 - **Flight recorder:** every decision is written to a hash-chained JSONL log before the call is forwarded, and an **allowed** decision reaches stable storage (fdatasync) first. Denials are written but not synced individually, so a flood of denied calls can't force a sync per call; the next sync persists them. If a decision can't be recorded, the call is denied. Use `--no-fsync` (on `writ wrap` or `writd`) to trade crash durability for latency.
 - **Redaction:** per rule, `redact: ["args.card", "args.headers.*"]` replaces values with `[redacted]` in the log, and `record_arguments: false` omits arguments entirely. When several rules apply, including a narrowing policy, their settings combine and the most protective wins. Decision reasons never echo a redacted value.
 - **`tools/list` filtering:** tools the policies always deny are hidden. This is a usability aid; enforcement happens on every `tools/call`.
@@ -54,7 +65,7 @@ Any writ.yaml field from the spec that this build doesn't enforce (`approvals`, 
 
 ## Not yet
 
-Signed writ tokens and lineage across hops, verified root principals, a real entitlement source (Stripe, CRM, IdP), approvals (so `require_sudo`, including on tainted tasks, refuses for now), finer-grained taint (per branch, per value), and external anchoring of the log. In cooperative mode, an agent with a shell or raw network access can bypass writ (plan-v2.md §5.2).
+Signed writ tokens and lineage across hops, verified root principals, a real entitlement source (Stripe, CRM, IdP), approvals over Slack and signed approver identities, precondition revalidation for approved calls, finer-grained taint (per branch, per value), and external anchoring of the log. In cooperative mode, an agent with a shell or raw network access can bypass writ (plan-v2.md §5.2).
 
 ## Usage
 

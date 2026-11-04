@@ -67,6 +67,11 @@ enum Commands {
     },
     /// List live tasks.
     Ps,
+    /// Decide calls waiting for approval (policies with an `approvals:` block, under writd).
+    Sudo {
+        #[command(subcommand)]
+        action: SudoAction,
+    },
     /// Validate a writ.yaml without running anything.
     Check { policy: PathBuf },
     /// Show or verify the flight recorder.
@@ -84,6 +89,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SudoAction {
+    /// List calls waiting for approval, oldest first.
+    List {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one waiting call in full: tool, arguments (redacted per policy), task facts, reason.
+    Show { id: String },
+    /// Let a waiting call run. It is re-checked first (task still live, limits not reached).
+    Approve { id: String },
+    /// Refuse a waiting call. The agent gets a policy denial.
+    Deny { id: String },
 }
 
 fn main() -> ExitCode {
@@ -142,6 +163,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             command,
         } => run_task(&policy, principal.as_deref(), log.as_deref(), &command),
         Commands::Ps => ps(),
+        Commands::Sudo { action } => sudo(action),
         Commands::Check { policy: path } => {
             let files = read_policy(&path)?;
             let parsed = Policy::from_yaml_str(&files.policy)?;
@@ -339,6 +361,7 @@ fn ps() -> Result<ExitCode> {
         "{:<28}  {:<10}  {:<20}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  COMMAND",
         "TASK", "USER", "PRINCIPAL", "NAMESPACE", "SESSIONS", "CALLS", "DENIED", "TAINTED", "AGE", "SERVERS"
     );
+    let any_principal = tasks.iter().any(|t| t.principal.is_some());
     for t in tasks {
         let calls = match t.max_tool_calls {
             Some(max) => format!("{}/{max}", t.counters.calls_allowed),
@@ -370,6 +393,9 @@ fn ps() -> Result<ExitCode> {
             command
         );
     }
+    if any_principal {
+        println!("(? = principal asserted with `writ run --principal`, not verified)");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -399,6 +425,130 @@ fn derive_server_name(command: &[String]) -> String {
         .take(64)
         .collect();
     if name.is_empty() { "server".to_string() } else { name }
+}
+
+fn sudo(action: SudoAction) -> Result<ExitCode> {
+    enum Kind {
+        Approve,
+        Other,
+    }
+    let action_kind = match action {
+        SudoAction::Approve { .. } => Kind::Approve,
+        _ => Kind::Other,
+    };
+    let socket = writ_daemon::default_socket_path();
+    let connect = || {
+        Client::connect(&socket)
+            .with_context(|| format!("cannot reach writd at {}; approvals live in writd", socket.display()))
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let ago = |ms: u64| humantime::format_duration(Duration::from_secs(now.saturating_sub(ms) / 1000)).to_string();
+    let left = |ms: u64| humantime::format_duration(Duration::from_secs(ms.saturating_sub(now) / 1000)).to_string();
+    match action {
+        SudoAction::List { json } => {
+            // Like `writ ps`: no writd means nothing can be waiting.
+            let Ok(mut client) = Client::connect(&socket) else {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("writd is not running ({}): no calls are waiting", socket.display());
+                }
+                return Ok(ExitCode::SUCCESS);
+            };
+            let approvals = client.list_approvals()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&approvals)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if approvals.is_empty() {
+                println!("no calls are waiting for approval");
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "{:<28}  {:>8}  {:>8}  {:<20}  {:<20}  {:<20}  REASON",
+                "ID", "WAITING", "EXPIRES", "PRINCIPAL", "SERVER", "TOOL"
+            );
+            for a in approvals {
+                println!(
+                    "{:<28}  {:>8}  {:>8}  {:<20}  {:<20}  {:<20}  {}",
+                    a.id,
+                    ago(a.created_ms),
+                    left(a.expires_ms),
+                    a.principal.as_deref().map_or("-".to_string(), |p| format!("{p}?")),
+                    a.server,
+                    a.tool,
+                    a.reason
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        SudoAction::Show { id } => {
+            let approvals = connect()?.list_approvals()?;
+            let a = approvals.iter().find(|a| a.id == id).with_context(|| {
+                format!(
+                    "no call is waiting for approval `{id}`: it may have been decided, timed out, \
+                         or ended with its task (see `writ log`)"
+                )
+            })?;
+            println!("approval   {}", a.id);
+            println!("task       {}", a.task);
+            match &a.principal {
+                Some(p) => println!("for        {p} (unverified)"),
+                None => println!("for        (no root principal)"),
+            }
+            println!("server     {}", a.server);
+            println!("tool       {}", a.tool);
+            match &a.arguments {
+                Some(args) => println!(
+                    "arguments  {}",
+                    serde_json::to_string_pretty(args)?.replace('\n', "\n           ")
+                ),
+                None => println!("arguments  (not recorded by policy)"),
+            }
+            if a.tainted {
+                println!("tainted    yes: read from {}", a.taint_sources.join(", "));
+            } else {
+                println!("tainted    no");
+            }
+            println!("why        {}", a.reason);
+            println!("waiting    {} (expires in {})", ago(a.created_ms), left(a.expires_ms));
+            Ok(ExitCode::SUCCESS)
+        }
+        SudoAction::Approve { id } | SudoAction::Deny { id } => {
+            let approve = matches!(action_kind, Kind::Approve);
+            if std::env::var_os(TASK_ENV).is_some() {
+                // A guard, not a boundary: same-user processes can reach writd directly.
+                bail!(
+                    "refusing to decide approval `{id}` from inside a writ task ({TASK_ENV} is set): \
+                     an agent must not approve its own calls. Run `writ sudo` from your own shell."
+                );
+            }
+            // Who ran this command, as the OS knows them. Not authenticated beyond that:
+            // anyone who can run commands as this user can approve.
+            let approver = json!({ "user": local_user(), "via": "writ sudo", "authenticated": false });
+            let decision = connect()?.resolve_approval(&id, approve, approver)?;
+            match decision.outcome {
+                writ_policy::Outcome::Allow => println!("approved {id}: the call runs now"),
+                _ if approve => println!("{id} was approved but still refused: {}", decision.reason),
+                _ => println!("denied {id}: the agent gets a policy denial"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// `$USER`, else `$LOGNAME`, else the account name for this uid.
+fn local_user() -> Option<String> {
+    let env = |key| std::env::var(key).ok().filter(|v| !v.is_empty());
+    env("USER").or_else(|| env("LOGNAME")).or_else(|| {
+        // SAFETY: getpwuid returns a pointer to static storage or null; we copy the name out immediately.
+        unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            (!pw.is_null()).then(|| std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
+        }
+    })
 }
 
 fn exit_code(code: i32) -> ExitCode {
@@ -441,10 +591,30 @@ fn format_entry(entry: &Entry) -> String {
             s(&d["source"])
         ),
         "tool_call" => format!(
-            "{} -> {} ({})",
+            "{}{} -> {}{} ({})",
             s(&d["tool"]),
+            match &d["arguments"] {
+                Value::Null => String::new(),
+                args => {
+                    let args = args.to_string();
+                    let short: String = args.chars().take(80).collect();
+                    format!(" {short}{}", if short.len() < args.len() { "…" } else { "" })
+                }
+            },
             s(&d["decision"]["outcome"]).to_uppercase(),
+            match d["decision"]["approval"].as_str() {
+                Some(id) => format!(" [waiting: {id}]"),
+                None => String::new(),
+            },
             s(&d["decision"]["reason"]),
+        ),
+        "approval" => format!(
+            "{} {} {} -> {} ({})",
+            s(&d["approval"]),
+            s(&d["decision"]).to_uppercase(),
+            s(&d["tool"]),
+            s(&d["outcome"]["outcome"]).to_uppercase(),
+            s(&d["outcome"]["reason"]),
         ),
         "tool_result" => format!(
             "{} {} in {}ms",

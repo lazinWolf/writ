@@ -17,6 +17,10 @@
 //!   in-process engine (standalone) or writd (shared task).
 //! - Requests the server sends to the client (sampling, elicitation) are
 //!   recorded but not yet governed by policy.
+//! - A call that needs approval (under writd, with an `approvals:` block)
+//!   is *paused*: it waits on a thread of its own while other calls and
+//!   results keep flowing, then is forwarded or answered with the decision.
+//!   The agent sees only the real result, never a placeholder (D4).
 //!
 //! Unix only: the server runs in its own process group (see `supervisor`).
 
@@ -34,9 +38,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use writ_policy::Outcome;
+use writ_policy::{Decision, Outcome};
 
-pub use backend::{Backend, DaemonBackend, LocalBackend};
+pub use backend::{ApprovalWaiter, Backend, DaemonBackend, LocalBackend};
 use supervisor::Event;
 
 pub struct WrapConfig {
@@ -64,6 +68,8 @@ struct State {
     backend: Box<dyn Backend>,
     pending_calls: HashMap<String, PendingCall>,
     pending_lists: HashSet<String>,
+    /// Calls waiting for approval, by id key: the tool name.
+    paused: HashMap<String, String>,
 }
 
 impl State {
@@ -76,6 +82,19 @@ impl State {
 }
 
 type Shared<T> = Arc<Mutex<T>>;
+
+/// The server's stdin, shared so an approved call can be forwarded from the
+/// thread that waited for it. `None` once the client has gone: dropping it
+/// is what tells the server to shut down.
+type ServerIn = Shared<Option<ChildStdin>>;
+
+/// Writes one message to the server. False if its stdin is closed or gone.
+fn forward(server_in: &ServerIn, message: &Value) -> bool {
+    let bytes = serde_json::to_string(message).expect("JSON value serializes");
+    let mut guard = server_in.lock().unwrap();
+    let Some(stdin) = guard.as_mut() else { return false };
+    writeln!(stdin, "{bytes}").and_then(|()| stdin.flush()).is_ok()
+}
 
 /// Runs the proxy until the server has exited and its stdout has closed.
 /// Returns the exit code writ should exit with: the server's, `128 + n` if
@@ -96,13 +115,14 @@ where
         .spawn()
         .with_context(|| format!("failed to start MCP server `{program}`"))?;
     let pid = child.id();
-    let server_in = child.stdin.take().expect("stdin is piped");
+    let server_in: ServerIn = Arc::new(Mutex::new(Some(child.stdin.take().expect("stdin is piped"))));
     let server_out = child.stdout.take().expect("stdout is piped");
 
     let mut state = State {
         backend: config.backend,
         pending_calls: HashMap::new(),
         pending_lists: HashSet::new(),
+        paused: HashMap::new(),
     };
     if let Err(e) = state.backend.open(
         &config.name,
@@ -156,7 +176,12 @@ where
         (None, None) => 1,
     };
     let mut state = state.lock().unwrap();
-    let unanswered: Vec<&str> = state.pending_calls.values().map(|p| p.tool.as_str()).collect();
+    let unanswered: Vec<&str> = state
+        .pending_calls
+        .values()
+        .map(|p| p.tool.as_str())
+        .chain(state.paused.values().map(String::as_str))
+        .collect();
     let data = json!({
         "exit_code": outcome.status.and_then(|s| s.code()),
         "server_signal": outcome.status.and_then(|s| s.signal()),
@@ -184,9 +209,9 @@ fn forward_signals(events: Sender<Event>) -> Result<()> {
     Ok(())
 }
 
-fn client_to_server<R: Read, W: Write>(
+fn client_to_server<R: Read, W: Write + Send + 'static>(
     client_in: R,
-    mut server_in: ChildStdin,
+    server_in: ServerIn,
     state: &Shared<State>,
     client_out: &Shared<W>,
 ) {
@@ -195,7 +220,7 @@ fn client_to_server<R: Read, W: Write>(
         if line.trim().is_empty() {
             continue;
         }
-        let forward = match serde_json::from_str::<Value>(&line) {
+        let outgoing = match serde_json::from_str::<Value>(&line) {
             Err(e) => {
                 state
                     .lock()
@@ -220,31 +245,45 @@ fn client_to_server<R: Read, W: Write>(
                 }
                 None
             }
-            Ok(message) => handle_client_message(message, state, client_out),
+            Ok(message) => handle_client_message(message, state, client_out, &server_in),
         };
-        if let Some(message) = forward {
-            let bytes = serde_json::to_string(&message).expect("JSON value serializes");
-            if writeln!(server_in, "{bytes}").and_then(|()| server_in.flush()).is_err() {
-                break;
-            }
+        if let Some(message) = outgoing
+            && !forward(&server_in, &message)
+        {
+            break;
         }
     }
-    // Dropping server_in closes the server's stdin, the MCP stdio shutdown signal.
+    // Dropping the server's stdin closes it: the MCP stdio shutdown signal. Calls
+    // still waiting for approval then have nowhere to go, and are dropped.
+    server_in.lock().unwrap().take();
 }
 
 /// Returns the message to forward to the server, or `None` if the proxy
 /// answered it itself.
-fn handle_client_message<W: Write>(message: Value, state: &Shared<State>, client_out: &Shared<W>) -> Option<Value> {
+fn handle_client_message<W: Write + Send + 'static>(
+    message: Value,
+    state: &Shared<State>,
+    client_out: &Shared<W>,
+    server_in: &ServerIn,
+) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str);
     let id = message.get("id").cloned();
 
     match (method, id) {
         (Some("tools/call"), Some(id)) => {
-            let mut state = state.lock().unwrap();
-            match decide_call(&message, &id, &mut state) {
-                Ok(()) => Some(message),
+            let mut guard = state.lock().unwrap();
+            match decide_call(&message, &id, &mut guard) {
+                Ok(Fate::Forward) => Some(message),
+                Ok(Fate::Paused { approval, waiter }) => {
+                    drop(guard);
+                    let (state, client_out, server_in) = (state.clone(), client_out.clone(), server_in.clone());
+                    thread::spawn(move || {
+                        await_approval(&approval, &*waiter, message, &state, &client_out, &server_in)
+                    });
+                    None
+                }
                 Err(reply) => {
-                    drop(state);
+                    drop(guard);
                     let _ = send(client_out, &reply);
                     None
                 }
@@ -266,9 +305,65 @@ fn handle_client_message<W: Write>(message: Value, state: &Shared<State>, client
     }
 }
 
-/// Decides a `tools/call`. `Ok` means forward it; `Err` carries the reply the
-/// proxy sends instead.
-fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<(), String> {
+/// What happens to a `tools/call` the policy didn't refuse outright.
+enum Fate {
+    Forward,
+    /// Waiting for a human: `waiter` blocks until `approval` is settled.
+    Paused {
+        approval: String,
+        waiter: Arc<dyn ApprovalWaiter>,
+    },
+}
+
+/// Waits for a paused call's approval on its own thread, then forwards the
+/// call or answers it with the denial. Other calls keep flowing meanwhile.
+fn await_approval<W: Write>(
+    approval: &str,
+    waiter: &dyn ApprovalWaiter,
+    message: Value,
+    state: &Shared<State>,
+    client_out: &Shared<W>,
+    server_in: &ServerIn,
+) {
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    let key = id_key(&id);
+    // If writd can't be reached, nobody can approve: deny.
+    let decision = waiter.wait(approval).unwrap_or_else(|e| {
+        Decision::new(
+            Outcome::Deny,
+            None,
+            format!("writ could not wait for approval `{approval}` ({e:#})"),
+        )
+    });
+    let mut guard = state.lock().unwrap();
+    let Some(tool) = guard.paused.remove(&key) else { return };
+    if decision.outcome == Outcome::Allow {
+        // writd recorded the approval durably before answering.
+        eprintln!("writ: `{tool}` approved ({approval}); forwarding it");
+        guard.pending_calls.insert(
+            key.clone(),
+            PendingCall {
+                tool,
+                started: Instant::now(),
+            },
+        );
+        drop(guard);
+        if !forward(server_in, &message) {
+            // The client left while we waited; there's nobody to answer.
+            state.lock().unwrap().pending_calls.remove(&key);
+        }
+    } else {
+        drop(guard);
+        let _ = send(
+            client_out,
+            &tool_error(&id, &format!("writ denied this call: {}", decision.reason)),
+        );
+    }
+}
+
+/// Decides a `tools/call`. `Ok` means forward it or wait; `Err` carries the
+/// reply the proxy sends instead.
+fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<Fate, String> {
     let params = message.get("params");
     let Some(tool) = params
         .and_then(|p| p.get("name"))
@@ -304,15 +399,26 @@ fn decide_call(message: &Value, id: &Value, state: &mut State) -> Result<(), Str
                     started: Instant::now(),
                 },
             );
-            Ok(())
+            Ok(Fate::Forward)
         }
-        Outcome::RequireSudo => Err(tool_error(
-            id,
-            &format!(
-                "writ: this call requires approval ({}). Approval is not available in this build, so the call was not executed.",
-                decision.reason
-            ),
-        )),
+        Outcome::RequireSudo => match (decision.approval, state.backend.approval_waiter()) {
+            (Some(approval), Some(waiter)) => {
+                eprintln!(
+                    "writ: `{tool}` is waiting for approval ({}). Decide with: writ sudo approve {approval}  (or: writ sudo deny {approval})",
+                    decision.reason
+                );
+                state.paused.insert(id_key(id), tool);
+                Ok(Fate::Paused { approval, waiter })
+            }
+            _ => Err(tool_error(
+                id,
+                &format!(
+                    "writ: this call requires approval ({}), and nobody can be asked: the policy has no \
+                     `approvals:` block, or this `writ wrap` runs without writd. The call was not executed.",
+                    decision.reason
+                ),
+            )),
+        },
         Outcome::Deny => Err(tool_error(id, &format!("writ denied this call: {}", decision.reason))),
     }
 }

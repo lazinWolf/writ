@@ -1,6 +1,6 @@
 # Demo: the poisoned ticket
 
-**Status: runs except for approvals.** Taint and entitlements work. The `approvals:` block is still rejected when the policy loads; without it, steps 5 and 6 below are refused instead of paused. `ROADMAP.md` step 6 adds approvals and `writ sudo`. The end-to-end tests in `crates/writ-cli/tests/demo.rs` are the definition of done.
+**Status: runs end to end.** The test `poisoned_ticket_demo` in `crates/writ-cli/tests/demo.rs` plays the agent and the approver, and checks every row below, the Stripe ledger, and the flight log.
 
 ## The story
 
@@ -27,7 +27,7 @@ writ decides using two more facts:
 
 Stripe executes exactly three money movements: the $10 credit from step 1 and the two refunds of Alice's charges. Approvals go to a human only when a call is over a limit or uncovered by entitlements on a tainted task.
 
-## Running it by hand (once steps 2–6 land)
+## Running it by hand
 
 Build first, then use two terminals.
 

@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -132,6 +132,53 @@ struct Task {
     ended: bool,
 }
 
+/// A `require_sudo` call paused until a human decides, it times out, or its
+/// task or session ends.
+struct Approval {
+    task: String,
+    session: String,
+    call_id: Value,
+    tool: String,
+    /// As recorded: redacted, or `None` if the policy omits arguments.
+    arguments: Option<Value>,
+    /// Why the call needs a human.
+    reason: String,
+    rule: Option<String>,
+    created_ms: u64,
+    expires_ms: u64,
+    deadline: Instant,
+    /// Set once decided; the waiting session collects it with
+    /// [`Engine::take_resolution`].
+    resolution: Option<Decision>,
+}
+
+/// One row of `writ sudo list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalSummary {
+    pub id: String,
+    pub task: String,
+    pub session: String,
+    pub principal: Option<String>,
+    /// The session's source, `mcp:<name>`.
+    pub server: String,
+    pub tool: String,
+    /// Redacted per policy; `null` when the policy omits arguments.
+    pub arguments: Option<Value>,
+    pub reason: String,
+    pub rule: Option<String>,
+    pub tainted: bool,
+    pub taint_sources: Vec<String>,
+    pub created_ms: u64,
+    pub expires_ms: u64,
+}
+
+/// How a pending approval was settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    Approve,
+    Deny,
+}
+
 struct Session {
     task: String,
     /// `mcp:<name>`.
@@ -165,6 +212,10 @@ pub struct TaskSummary {
 
 pub struct Engine {
     recorder: Recorder,
+    /// True in writd. A standalone `writ wrap` has nobody to ask, so its
+    /// `require_sudo` calls are refused.
+    approvals_enabled: bool,
+    approvals: BTreeMap<String, Approval>,
     tasks: BTreeMap<String, Task>,
     sessions: BTreeMap<String, Session>,
 }
@@ -173,9 +224,18 @@ impl Engine {
     pub fn new(recorder: Recorder) -> Self {
         Engine {
             recorder,
+            approvals_enabled: false,
+            approvals: BTreeMap::new(),
             tasks: BTreeMap::new(),
             sessions: BTreeMap::new(),
         }
+    }
+
+    /// Lets `require_sudo` calls pause for a human when the task's policy has
+    /// an `approvals:` block. Only writd does this: someone must be able to
+    /// reach the engine to decide.
+    pub fn enable_approvals(&mut self) {
+        self.approvals_enabled = true;
     }
 
     /// Creates a root task acting for `authority`. `meta` describes who and
@@ -250,6 +310,9 @@ impl Engine {
             return Ok(());
         }
         task.ended = true;
+        let owner = task_id.to_string();
+        self.cancel_approvals("the task ended", |a| a.task == owner);
+        let task = self.tasks.get_mut(task_id).expect("task exists");
         let data =
             json!({ "task": task_id, "reason": reason, "counters": task.counters, "open_sessions": task.sessions });
         let empty = task.sessions.is_empty();
@@ -360,11 +423,11 @@ impl Engine {
         };
         let ctx = DecisionContext::new(tool, args, &facts).with_source(task.source.as_deref());
         let mut decision = if task.ended {
-            Decision {
-                outcome: Outcome::Deny,
-                rule: None,
-                reason: format!("task `{}` has ended; its authority is revoked", session.task),
-            }
+            Decision::new(
+                Outcome::Deny,
+                None,
+                format!("task `{}` has ended; its authority is revoked", session.task),
+            )
         } else {
             let from_task = task.policy.policy.evaluate(&ctx);
             match &session.policy {
@@ -383,23 +446,16 @@ impl Engine {
                 None => from_task,
             }
         };
-        if decision.outcome == Outcome::Allow {
-            let limits = [
-                (
-                    task.policy.policy.limits.max_tool_calls,
-                    task.counters.calls_allowed,
-                    "task",
-                ),
-                (
-                    session.policy.as_ref().and_then(|p| p.policy.limits.max_tool_calls),
-                    session.counters.calls_allowed,
-                    "session",
-                ),
-            ];
-            if let Some((max, _, scope)) = limits.iter().find(|(max, used, _)| max.is_some_and(|m| *used >= m)) {
-                decision.outcome = Outcome::Deny;
-                decision.reason = format!("{scope} max_tool_calls limit reached ({})", max.unwrap());
-            }
+        if decision.outcome == Outcome::Allow
+            && let Some(reason) = limit_reached(task, session)
+        {
+            decision.outcome = Outcome::Deny;
+            decision.reason = reason;
+        }
+        // Pause for a human instead of refusing, if this task can be asked.
+        let timeout = approval_timeout(task, session).filter(|_| self.approvals_enabled);
+        if decision.outcome == Outcome::RequireSudo && timeout.is_some() {
+            decision.approval = Some(new_id("apr"));
         }
 
         let mut data = json!({
@@ -418,52 +474,264 @@ impl Engine {
                 Some(own) => own.policy.arguments_for_log(tool, &logged),
                 None => Some(logged),
             });
-        match logged {
-            Some(arguments) => data["arguments"] = arguments,
+        match &logged {
+            Some(arguments) => data["arguments"] = arguments.clone(),
             None => data["arguments_omitted"] = json!(true),
+        }
+        if let (Some(id), Some(timeout)) = (&decision.approval, timeout) {
+            // Recorded durably: a pending approval is a decision someone will act on.
+            self.recorder.append_durable(session_id, "tool_call", data)?;
+            let now = now_ms();
+            self.approvals.insert(
+                id.clone(),
+                Approval {
+                    task: session.task.clone(),
+                    session: session_id.to_string(),
+                    call_id: call_id.clone(),
+                    tool: tool.to_string(),
+                    arguments: logged,
+                    reason: decision.reason.clone(),
+                    rule: decision.rule.clone(),
+                    created_ms: now,
+                    expires_ms: now + timeout.as_millis() as u64,
+                    deadline: Instant::now() + timeout,
+                    resolution: None,
+                },
+            );
+            // Counted once it is decided.
+            return Ok(decision);
         }
         // Only an allowed decision gates an action, so only it waits for stable storage.
         // A denial is persisted by the next sync, and a flood of denied calls (the shape
         // of an injection attempt) cannot force a sync per call.
         let allowed = decision.outcome == Outcome::Allow;
-        // An allowed call to an untrusted source taints its task before the call is
-        // forwarded: its result is about to enter the agent's context. Either policy
-        // may declare the source untrusted. Taint is never cleared.
-        let source = &session.source;
-        let taints = allowed
-            && !task.facts.taint_sources.contains(source)
-            && (task.policy.policy.is_untrusted(source)
-                || session.policy.as_ref().is_some_and(|p| p.policy.is_untrusted(source)));
-        let task_id = session.task.clone();
-        if taints {
-            let source = source.clone();
+        if allowed {
             // Recorded first and durably: if this fails the call is denied, and a
             // taint without its call is the safe side to err on.
-            self.recorder.append_durable(
-                session_id,
-                "taint",
-                json!({ "task": task_id, "source": source, "id": call_id, "tool": tool }),
-            )?;
-            let facts = &mut self.tasks.get_mut(&task_id).expect("task exists").facts;
-            facts.tainted = true;
-            facts.taint_sources.push(source);
-        }
-        if allowed {
+            self.taint_if_untrusted(session_id, call_id, tool)?;
             self.recorder.append_durable(session_id, "tool_call", data)?;
         } else {
             self.recorder.append(session_id, "tool_call", data)?;
         }
-        for counters in [
-            &mut self.sessions.get_mut(session_id).unwrap().counters,
-            &mut self.tasks.get_mut(&task_id).unwrap().counters,
-        ] {
+        self.count(session_id, allowed);
+        Ok(decision)
+    }
+
+    /// An allowed call to an untrusted source taints its task before the call
+    /// is forwarded: its result is about to enter the agent's context. Either
+    /// policy may declare the source untrusted. Taint is never cleared.
+    fn taint_if_untrusted(&mut self, session_id: &str, call_id: &Value, tool: &str) -> Result<(), EngineError> {
+        let session = &self.sessions[session_id];
+        let task = &self.tasks[&session.task];
+        let source = &session.source;
+        let taints = !task.facts.taint_sources.contains(source)
+            && (task.policy.policy.is_untrusted(source)
+                || session.policy.as_ref().is_some_and(|p| p.policy.is_untrusted(source)));
+        if !taints {
+            return Ok(());
+        }
+        let (task_id, source) = (session.task.clone(), source.clone());
+        self.recorder.append_durable(
+            session_id,
+            "taint",
+            json!({ "task": task_id, "source": source, "id": call_id, "tool": tool }),
+        )?;
+        let facts = &mut self.tasks.get_mut(&task_id).expect("task exists").facts;
+        facts.tainted = true;
+        facts.taint_sources.push(source);
+        Ok(())
+    }
+
+    fn count(&mut self, session_id: &str, allowed: bool) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        let task_id = session.task.clone();
+        let mut counters = vec![&mut session.counters];
+        if let Some(task) = self.tasks.get_mut(&task_id) {
+            counters.push(&mut task.counters);
+        }
+        for c in counters {
             if allowed {
-                counters.calls_allowed += 1;
+                c.calls_allowed += 1;
             } else {
-                counters.calls_denied += 1;
+                c.calls_denied += 1;
             }
         }
+    }
+
+    /// Pending approvals, oldest first.
+    pub fn approvals(&self) -> Vec<ApprovalSummary> {
+        let mut list: Vec<ApprovalSummary> = self
+            .approvals
+            .iter()
+            .filter(|(_, a)| a.resolution.is_none())
+            .map(|(id, a)| {
+                let facts = self.tasks.get(&a.task).map(|t| &t.facts);
+                ApprovalSummary {
+                    id: id.clone(),
+                    task: a.task.clone(),
+                    session: a.session.clone(),
+                    principal: facts.and_then(|f| f.root.as_ref()).map(|r| r.principal.clone()),
+                    server: self
+                        .sessions
+                        .get(&a.session)
+                        .map(|s| s.source.clone())
+                        .unwrap_or_default(),
+                    tool: a.tool.clone(),
+                    arguments: a.arguments.clone(),
+                    reason: a.reason.clone(),
+                    rule: a.rule.clone(),
+                    tainted: facts.is_some_and(|f| f.tainted),
+                    taint_sources: facts.map(|f| f.taint_sources.clone()).unwrap_or_default(),
+                    created_ms: a.created_ms,
+                    expires_ms: a.expires_ms,
+                }
+            })
+            .collect();
+        list.sort_by_key(|a| a.created_ms);
+        list
+    }
+
+    /// When a pending approval times out; `None` if it's unknown or decided.
+    pub fn approval_deadline(&self, id: &str) -> Option<Instant> {
+        self.approvals
+            .get(id)
+            .filter(|a| a.resolution.is_none())
+            .map(|a| a.deadline)
+    }
+
+    /// Settles a pending approval. `approver` (who decided) is recorded as
+    /// given. An approved call is re-checked first: its task may have ended,
+    /// or its limits been reached, while it waited. Returns the final decision.
+    pub fn resolve_approval(
+        &mut self,
+        id: &str,
+        resolution: Resolution,
+        approver: Value,
+    ) -> Result<Decision, EngineError> {
+        let approval = self
+            .approvals
+            .get(id)
+            .ok_or_else(|| EngineError::Invalid(format!("unknown approval `{id}`")))?;
+        if approval.resolution.is_some() {
+            return Err(EngineError::Invalid(format!(
+                "approval `{id}` has already been decided"
+            )));
+        }
+        let who = match approver["user"].as_str() {
+            Some(user) => format!("approver {user}"),
+            None => "an approver".to_string(),
+        };
+        let decision = match resolution {
+            Resolution::Deny => Decision::new(
+                Outcome::Deny,
+                approval.rule.clone(),
+                format!("{who} denied this call; it needed approval because {}", approval.reason),
+            ),
+            Resolution::Approve => {
+                let session = self.sessions.get(&approval.session);
+                let task = self.tasks.get(&approval.task);
+                let blocked = match (task, session) {
+                    (Some(task), _) if task.ended => Some(format!("task `{}` ended while waiting", approval.task)),
+                    (Some(task), Some(session)) => limit_reached(task, session),
+                    _ => Some("its session ended while waiting".to_string()),
+                };
+                match blocked {
+                    Some(why) => Decision::new(
+                        Outcome::Deny,
+                        approval.rule.clone(),
+                        format!("approved by {who}, but {why}"),
+                    ),
+                    None => Decision::new(
+                        Outcome::Allow,
+                        approval.rule.clone(),
+                        format!("approved by {who}; it needed approval because {}", approval.reason),
+                    ),
+                }
+            }
+        };
+        let label = match resolution {
+            Resolution::Approve => "approve",
+            Resolution::Deny => "deny",
+        };
+        self.settle(id, label, approver, decision)
+    }
+
+    /// Denies a pending approval whose deadline has passed. A no-op if it's
+    /// already decided or not yet due.
+    pub fn expire_approval(&mut self, id: &str) -> Result<(), EngineError> {
+        let Some(approval) = self.approvals.get(id) else {
+            return Ok(());
+        };
+        if approval.resolution.is_some() || Instant::now() < approval.deadline {
+            return Ok(());
+        }
+        let waited = Duration::from_millis(approval.expires_ms - approval.created_ms);
+        let decision = Decision::new(
+            Outcome::Deny,
+            approval.rule.clone(),
+            format!(
+                "no approver decided within {}; the call was not executed",
+                humantime::format_duration(waited)
+            ),
+        );
+        self.settle(id, "timeout", Value::Null, decision).map(|_| ())
+    }
+
+    /// Records how an approval was settled and stores the final decision
+    /// for the waiting session.
+    fn settle(&mut self, id: &str, label: &str, approver: Value, decision: Decision) -> Result<Decision, EngineError> {
+        let approval = &self.approvals[id];
+        let (session_id, call_id, tool, task_id) = (
+            approval.session.clone(),
+            approval.call_id.clone(),
+            approval.tool.clone(),
+            approval.task.clone(),
+        );
+        let allowed = decision.outcome == Outcome::Allow;
+        if allowed && self.sessions.contains_key(&session_id) {
+            self.taint_if_untrusted(&session_id, &call_id, &tool)?;
+        }
+        let data = json!({
+            "approval": id,
+            "task": task_id,
+            "id": call_id,
+            "tool": tool,
+            "decision": label,
+            "approver": approver,
+            "outcome": decision,
+        });
+        // Durable either way: an approval is a human's decision, and an approved call
+        // is forwarded only after this returns.
+        self.recorder.append_durable(&session_id, "approval", data)?;
+        self.count(&session_id, allowed);
+        self.approvals.get_mut(id).expect("approval exists").resolution = Some(decision.clone());
         Ok(decision)
+    }
+
+    /// The final decision of a settled approval, removing it. `None` while
+    /// it's pending.
+    pub fn take_resolution(&mut self, id: &str) -> Option<Decision> {
+        self.approvals.get(id)?.resolution.as_ref()?;
+        self.approvals.remove(id).and_then(|a| a.resolution)
+    }
+
+    /// Denies every pending approval matching `pending`, recording `why`.
+    fn cancel_approvals(&mut self, why: &str, pending: impl Fn(&Approval) -> bool) {
+        let ids: Vec<String> = self
+            .approvals
+            .iter()
+            .filter(|(_, a)| a.resolution.is_none() && pending(a))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let rule = self.approvals[&id].rule.clone();
+            let decision = Decision::new(Outcome::Deny, rule, format!("{why} while the call waited for approval"));
+            if let Err(e) = self.settle(&id, "cancelled", Value::Null, decision) {
+                eprintln!("writd: {e}");
+            }
+        }
     }
 
     /// Records a non-gating event (tool results, protocol errors, ...).
@@ -502,10 +770,12 @@ impl Engine {
     /// implicit task ends with its only session; an ended task is dropped
     /// once its last session closes.
     pub fn close_session(&mut self, session_id: &str, mut data: Value) -> Result<(), EngineError> {
-        let session = self
-            .sessions
-            .remove(session_id)
-            .ok_or_else(|| EngineError::UnknownSession(session_id.to_string()))?;
+        if !self.sessions.contains_key(session_id) {
+            return Err(EngineError::UnknownSession(session_id.to_string()));
+        }
+        self.cancel_approvals("the session closed", |a| a.session == session_id);
+        self.approvals.retain(|_, a| a.session != session_id);
+        let session = self.sessions.remove(session_id).expect("session exists");
         if let Value::Object(map) = &mut data {
             map.insert("task".into(), json!(session.task));
             map.insert("counters".into(), json!(session.counters));
@@ -557,6 +827,38 @@ impl Engine {
         tasks.sort_by_key(|t| t.started_ms);
         tasks
     }
+}
+
+/// Why another allowed call would exceed a `max_tool_calls` limit, if it would.
+fn limit_reached(task: &Task, session: &Session) -> Option<String> {
+    let limits = [
+        (
+            task.policy.policy.limits.max_tool_calls,
+            task.counters.calls_allowed,
+            "task",
+        ),
+        (
+            session.policy.as_ref().and_then(|p| p.policy.limits.max_tool_calls),
+            session.counters.calls_allowed,
+            "session",
+        ),
+    ];
+    limits.iter().find_map(|(max, used, scope)| {
+        max.filter(|m| used >= m)
+            .map(|m| format!("{scope} max_tool_calls limit reached ({m})"))
+    })
+}
+
+/// How long a `require_sudo` call may wait for a human, or `None` if the
+/// task's policy has no `approvals:` block. A narrowing policy may shorten it.
+fn approval_timeout(task: &Task, session: &Session) -> Option<Duration> {
+    let base = task.policy.policy.approvals?.timeout;
+    let narrowed = session
+        .policy
+        .as_ref()
+        .and_then(|p| p.policy.approvals)
+        .map(|a| a.timeout);
+    Some(narrowed.map_or(base, |n| n.min(base)))
 }
 
 fn now_ms() -> u64 {
@@ -873,6 +1175,163 @@ tables:
             decide(&mut e, &s, "stripe.refund", json!({"charge": "ch_a"})),
             Outcome::Allow
         );
+    }
+
+    const SUDO_POLICY: &str = r#"
+version: 1
+namespace: sudo
+limits:
+  max_tool_calls: 2
+approvals:
+  timeout: 50ms
+capabilities:
+  - tool: "stripe.refund"
+    redact: ["args.card"]
+    conditions: ["args.amount <= 100"]
+    on_violation: require_sudo
+  - tool: "db.query"
+"#;
+
+    fn sudo_engine() -> (Engine, tempfile::TempDir, String, String) {
+        let (mut e, dir) = engine();
+        e.enable_approvals();
+        let task = e
+            .create_task(policy(SUDO_POLICY), Authority::default(), json!({}))
+            .unwrap();
+        let s = e.open_session(Some(&task), None, None, "stripe", json!({})).unwrap();
+        (e, dir, task, s)
+    }
+
+    fn pause(e: &mut Engine, s: &str, call: u64) -> String {
+        let d = e
+            .decide(
+                s,
+                &json!(call),
+                "stripe.refund",
+                &json!({"amount": 240, "card": "4242"}),
+            )
+            .unwrap();
+        assert_eq!(d.outcome, Outcome::RequireSudo);
+        d.approval.expect("paused for approval")
+    }
+
+    #[test]
+    fn approvals_pause_then_settle() {
+        let (mut e, dir, _task, s) = sudo_engine();
+        let id = pause(&mut e, &s, 1);
+        let pending = e.approvals();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].server, "mcp:stripe");
+        assert_eq!(pending[0].arguments.as_ref().unwrap()["card"], writ_policy::REDACTED);
+        assert!(e.take_resolution(&id).is_none(), "still pending");
+        assert_eq!(
+            e.tasks()[0].counters,
+            Counters::default(),
+            "pending calls aren't counted"
+        );
+
+        let d = e
+            .resolve_approval(&id, Resolution::Approve, json!({"user": "bob"}))
+            .unwrap();
+        assert_eq!(d.outcome, Outcome::Allow);
+        assert!(d.reason.contains("approved by approver bob"), "{}", d.reason);
+        assert!(e.approvals().is_empty());
+        assert!(
+            e.resolve_approval(&id, Resolution::Deny, json!({})).is_err(),
+            "decided once"
+        );
+        assert_eq!(e.take_resolution(&id).unwrap().outcome, Outcome::Allow);
+        assert!(e.take_resolution(&id).is_none(), "collected once");
+        assert_eq!(e.tasks()[0].counters.calls_allowed, 1);
+
+        let id = pause(&mut e, &s, 2);
+        let d = e
+            .resolve_approval(&id, Resolution::Deny, json!({"user": "bob"}))
+            .unwrap();
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("approver bob denied this call"), "{}", d.reason);
+        assert!(!d.reason.contains("(an approver)"), "{}", d.reason);
+
+        let log = writ_recorder::read_entries(dir.path().join("flight.jsonl")).unwrap();
+        let settled: Vec<&str> = log
+            .iter()
+            .filter(|entry| entry.kind == "approval")
+            .map(|entry| entry.data["decision"].as_str().unwrap())
+            .collect();
+        assert_eq!(settled, ["approve", "deny"]);
+        assert!(
+            !std::fs::read_to_string(dir.path().join("flight.jsonl"))
+                .unwrap()
+                .contains("4242")
+        );
+    }
+
+    #[test]
+    fn approved_calls_are_rechecked() {
+        let (mut e, _dir, task, s) = sudo_engine();
+        let a = pause(&mut e, &s, 1);
+        let b = pause(&mut e, &s, 2);
+        // Meanwhile two allowed calls reach max_tool_calls (2).
+        assert_eq!(decide(&mut e, &s, "db.query", json!({})), Outcome::Allow);
+        assert_eq!(decide(&mut e, &s, "db.query", json!({})), Outcome::Allow);
+        let d = e.resolve_approval(&a, Resolution::Approve, json!({})).unwrap();
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("max_tool_calls"), "{}", d.reason);
+
+        e.end_task(&task, "test").unwrap();
+        // Ending the task settled the other one: denied, nothing left pending.
+        assert!(e.approvals().is_empty());
+        let d = e.take_resolution(&b).unwrap();
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("task ended"), "{}", d.reason);
+    }
+
+    #[test]
+    fn approvals_time_out_and_close_with_their_session() {
+        let (mut e, _dir, task, s) = sudo_engine();
+        let id = pause(&mut e, &s, 1);
+        e.expire_approval(&id).unwrap();
+        assert!(e.take_resolution(&id).is_none(), "not yet due");
+        std::thread::sleep(Duration::from_millis(60));
+        e.expire_approval(&id).unwrap();
+        let d = e.take_resolution(&id).unwrap();
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("no approver decided within"), "{}", d.reason);
+
+        let other = e.open_session(Some(&task), None, None, "stripe2", json!({})).unwrap();
+        let id = pause(&mut e, &other, 2);
+        e.close_session(&other, json!({})).unwrap();
+        assert!(e.approval_deadline(&id).is_none() && e.take_resolution(&id).is_none());
+        assert!(e.resolve_approval(&id, Resolution::Approve, json!({})).is_err());
+    }
+
+    #[test]
+    fn without_writd_or_an_approvals_block_nothing_pauses() {
+        // A standalone engine (no enable_approvals) has nobody to ask.
+        let (mut e, _dir) = engine();
+        let task = e
+            .create_task(policy(SUDO_POLICY), Authority::default(), json!({}))
+            .unwrap();
+        let s = e.open_session(Some(&task), None, None, "stripe", json!({})).unwrap();
+        let d = e
+            .decide(&s, &json!(1), "stripe.refund", &json!({"amount": 240}))
+            .unwrap();
+        assert_eq!((d.outcome, d.approval), (Outcome::RequireSudo, None));
+
+        // writd, but the policy has no approvals block: refused as before.
+        let (mut e, _dir) = engine();
+        e.enable_approvals();
+        let no_block = SUDO_POLICY.replace("approvals:\n  timeout: 50ms\n", "");
+        let task = e
+            .create_task(policy(&no_block), Authority::default(), json!({}))
+            .unwrap();
+        let s = e.open_session(Some(&task), None, None, "stripe", json!({})).unwrap();
+        let d = e
+            .decide(&s, &json!(1), "stripe.refund", &json!({"amount": 240}))
+            .unwrap();
+        assert_eq!((d.outcome, d.approval), (Outcome::RequireSudo, None));
+        assert_eq!(e.tasks()[0].counters.calls_denied, 1);
     }
 
     #[test]

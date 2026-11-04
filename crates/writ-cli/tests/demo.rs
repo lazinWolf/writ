@@ -1,14 +1,10 @@
 //! The poisoned-ticket demo (plan-v2.md scenario 1, `examples/poisoned-ticket`).
 //!
-//! `poisoned_ticket_demo` is the definition of done for ROADMAP.md steps 2–6,
-//! and is ignored until step 6 (approvals) lands. `poisoned_ticket_without_approvals`
-//! runs everything else today. Run it with:
+//! `poisoned_ticket_demo` is the definition of done for ROADMAP.md steps 2–6.
+//! `poisoned_ticket_without_approvals` runs the same story with nobody to ask.
+//! Run them with `cargo test -p writ-cli --test demo`.
 //!
-//! ```text
-//! cargo test -p writ-cli --test demo -- --ignored
-//! ```
-//!
-//! It uses interfaces that don't exist yet, and pins down their shape:
+//! The demo pins down the shape of these interfaces:
 //! - `writ wrap --name <name>`: the session is `mcp:<name>`.
 //! - `writ run --principal <id>`: the task's root principal (unverified).
 //! - `writ sudo list --json`: a JSON array of pending approvals, each with
@@ -99,8 +95,7 @@ fn text(response: &Value) -> &str {
     response["result"]["content"][0]["text"].as_str().unwrap_or_default()
 }
 
-/// The fixtures behave as the demo assumes. Runs today, so they can't rot
-/// while the demo itself is ignored.
+/// The fixtures behave as the demo assumes, checked without writ in the way.
 #[test]
 fn demo_fixtures_behave() {
     require_python!();
@@ -168,16 +163,15 @@ fn demo_fixtures_behave() {
     }
 }
 
-/// Everything in the demo except approvals (ROADMAP.md step 6): the demo
-/// policy with its `approvals:` block removed, so calls that need a human
-/// are refused instead of paused. Runs today.
+/// The demo policy with its `approvals:` block removed: calls that need a
+/// human are refused instead of paused, and everything else is the same.
 #[test]
 fn poisoned_ticket_without_approvals() {
     require_python!();
     let dir = tempfile::tempdir().unwrap();
     let path = |name: &str| dir.path().join(name);
     let demo = std::fs::read_to_string(example("writ.yaml")).unwrap();
-    let start = demo.find("approvals:").expect("demo policy has an approvals block");
+    let start = 1 + demo.find("\napprovals:").expect("demo policy has an approvals block");
     let end = start + demo[start..].find("\n\n").unwrap();
     std::fs::write(path("writ.yaml"), format!("{}{}", &demo[..start], &demo[end + 2..])).unwrap();
     std::fs::copy(example("entitlements.yaml"), path("entitlements.yaml")).unwrap();
@@ -266,7 +260,6 @@ fn next_pending(writ: &dyn Fn() -> Command, agent: &mut Child, deadline: Instant
 }
 
 #[test]
-#[ignore = "target for ROADMAP.md step 6: needs approvals and writ sudo"]
 fn poisoned_ticket_demo() {
     require_python!();
     let dir = tempfile::tempdir().unwrap();

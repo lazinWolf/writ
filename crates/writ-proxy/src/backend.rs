@@ -2,6 +2,9 @@
 //! `writ wrap`) or in writd (a task shared with other sessions). Both run the
 //! same `writ_daemon::Engine`.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use writ_daemon::{Client, Engine, LoadedEntitlements, LoadedPolicy};
@@ -17,6 +20,28 @@ pub trait Backend: Send {
     fn record(&mut self, kind: &str, data: Value) -> Result<()>;
     fn hidden_tools(&mut self, names: &[String]) -> Result<Vec<String>>;
     fn close(&mut self, data: Value) -> Result<()>;
+    /// How to wait for a paused call's approval, if this backend can pause
+    /// calls. Waiting must not block the backend itself.
+    fn approval_waiter(&self) -> Option<Arc<dyn ApprovalWaiter>> {
+        None
+    }
+}
+
+/// Waits for a human to settle a pending approval.
+pub trait ApprovalWaiter: Send + Sync {
+    /// Blocks until approval `id` is settled or times out, and returns the
+    /// final decision. `Err` means the call must be denied.
+    fn wait(&self, id: &str) -> Result<Decision>;
+}
+
+/// Waits on a fresh writd connection, so the session's own connection stays
+/// free for other calls.
+struct SocketWaiter(PathBuf);
+
+impl ApprovalWaiter for SocketWaiter {
+    fn wait(&self, id: &str) -> Result<Decision> {
+        Client::connect(&self.0)?.wait_approval(id)
+    }
 }
 
 /// Standalone: an implicit task with this session's policy, recorded locally.
@@ -117,5 +142,9 @@ impl Backend for DaemonBackend {
 
     fn close(&mut self, data: Value) -> Result<()> {
         self.client.close_session(data)
+    }
+
+    fn approval_waiter(&self) -> Option<Arc<dyn ApprovalWaiter>> {
+        Some(Arc::new(SocketWaiter(self.client.socket().to_path_buf())))
     }
 }

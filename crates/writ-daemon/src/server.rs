@@ -1,24 +1,67 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::engine::{Authority, Engine, EngineError, LoadedEntitlements, LoadedPolicy};
+use crate::engine::{Authority, Engine, EngineError, LoadedEntitlements, LoadedPolicy, Resolution};
 use crate::protocol::{Request, Response};
 
+/// The engine, plus a condition variable signalled whenever a request may
+/// have settled an approval, so waiters can sleep without holding the lock.
+pub struct Shared {
+    pub engine: Mutex<Engine>,
+    changed: Condvar,
+}
+
+impl Shared {
+    pub fn new(engine: Engine) -> Self {
+        Shared {
+            engine: Mutex::new(engine),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Blocks until approval `id` is settled (or times out) and returns its
+    /// final decision. Holds the engine lock only while checking.
+    fn wait_approval(&self, id: &str) -> Result<writ_policy::Decision, EngineError> {
+        let mut engine = self.engine.lock().unwrap();
+        loop {
+            if let Some(decision) = engine.take_resolution(id) {
+                return Ok(decision);
+            }
+            let deadline = engine
+                .approval_deadline(id)
+                .ok_or_else(|| EngineError::Invalid(format!("unknown approval `{id}`")))?;
+            let now = Instant::now();
+            if now >= deadline {
+                engine.expire_approval(id)?;
+                continue;
+            }
+            engine = self.changed.wait_timeout(engine, deadline - now).unwrap().0;
+        }
+    }
+}
+
 /// Accepts connections forever, one thread per connection.
-pub fn serve(listener: UnixListener, engine: Arc<Mutex<Engine>>) {
+pub fn serve(listener: UnixListener, shared: Arc<Shared>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if !same_user(&stream) {
-            // The socket directory is 0700, so this is defence in depth.
+        // The socket directory is 0700, so this is defence in depth.
+        let Some(peer_pid) = same_user_peer(&stream) else {
             continue;
-        }
-        let engine = engine.clone();
-        thread::spawn(move || Connection::default().run(stream, &engine));
+        };
+        let shared = shared.clone();
+        thread::spawn(move || {
+            Connection {
+                peer_pid,
+                ..Connection::default()
+            }
+            .run(stream, &shared)
+        });
     }
 }
 
@@ -26,10 +69,13 @@ pub fn serve(listener: UnixListener, engine: Arc<Mutex<Engine>>) {
 struct Connection {
     session: Option<String>,
     tasks: Vec<String>,
+    /// The peer's pid, when the platform reports it. Recorded with approvals.
+    peer_pid: Option<i32>,
 }
 
 impl Connection {
-    fn run(mut self, stream: UnixStream, engine: &Mutex<Engine>) {
+    fn run(mut self, stream: UnixStream, shared: &Shared) {
+        let engine = &shared.engine;
         let Ok(read_half) = stream.try_clone() else { return };
         let mut writer = stream;
         for line in BufReader::new(read_half).lines() {
@@ -45,10 +91,23 @@ impl Connection {
                 continue;
             }
             let response = match request {
-                Ok(request) => match self.handle(request, &mut engine.lock().unwrap()) {
-                    Ok(body) => Response::Ok { body },
+                // Waits without holding the engine lock, so this connection must not
+                // hold a session: the proxy opens a separate connection to wait.
+                Ok(Request::WaitApproval { id }) => match shared.wait_approval(&id) {
+                    Ok(decision) => Response::Ok {
+                        body: serde_json::to_value(decision).expect("decision serializes"),
+                    },
                     Err(e) => Response::Error { message: e.to_string() },
                 },
+                Ok(request) => {
+                    let result = self.handle(request, &mut engine.lock().unwrap());
+                    // Any request may have settled an approval (approve, deny, end a task).
+                    shared.changed.notify_all();
+                    match result {
+                        Ok(body) => Response::Ok { body },
+                        Err(e) => Response::Error { message: e.to_string() },
+                    }
+                }
                 Err(e) => Response::Error {
                     message: format!("bad request: {e}"),
                 },
@@ -68,6 +127,8 @@ impl Connection {
         for task in self.tasks.drain(..) {
             report(engine.end_task(&task, "creator disconnected"));
         }
+        drop(engine);
+        shared.changed.notify_all();
     }
 
     fn handle(&mut self, request: Request, engine: &mut Engine) -> Result<Value, EngineError> {
@@ -124,6 +185,23 @@ impl Connection {
                 Ok(Value::Null)
             }
             Request::Ps => Ok(json!({ "tasks": engine.tasks() })),
+            Request::ListApprovals => Ok(json!({ "approvals": engine.approvals() })),
+            Request::ResolveApproval {
+                id,
+                approve,
+                mut approver,
+            } => {
+                // Who decided, as the kernel reports it, alongside what the client says.
+                if let Value::Object(map) = &mut approver {
+                    map.insert("pid".into(), json!(self.peer_pid));
+                    // SAFETY: getuid has no preconditions. Peers are checked to share it.
+                    map.insert("uid".into(), json!(unsafe { libc::getuid() }));
+                }
+                let resolution = if approve { Resolution::Approve } else { Resolution::Deny };
+                let decision = engine.resolve_approval(&id, resolution, approver)?;
+                Ok(serde_json::to_value(decision).expect("decision serializes"))
+            }
+            Request::WaitApproval { .. } => unreachable!("handled before dispatch: it waits without the lock"),
         }
     }
 
@@ -142,8 +220,10 @@ fn report(result: Result<(), EngineError>) {
     }
 }
 
+/// `Some(pid)` when the peer runs as this user (the pid is `None` where the
+/// platform doesn't report it); `None` to refuse the connection.
 #[cfg(target_os = "linux")]
-fn same_user(stream: &UnixStream) -> bool {
+fn same_user_peer(stream: &UnixStream) -> Option<Option<i32>> {
     use std::os::fd::AsRawFd;
     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -158,12 +238,12 @@ fn same_user(stream: &UnixStream) -> bool {
         )
     };
     // SAFETY: getuid has no preconditions.
-    rc == 0 && cred.uid == unsafe { libc::getuid() }
+    (rc == 0 && cred.uid == unsafe { libc::getuid() }).then_some(Some(cred.pid))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn same_user(_stream: &UnixStream) -> bool {
-    true
+fn same_user_peer(_stream: &UnixStream) -> Option<Option<i32>> {
+    Some(None)
 }
 
 /// Runs writd until it receives SIGTERM, SIGINT, or SIGHUP.
@@ -204,8 +284,10 @@ pub fn run(socket: &Path, log: &Path, fsync: bool) -> anyhow::Result<()> {
 
     let mut recorder = writ_recorder::Recorder::open(log)?;
     recorder.set_fsync(fsync);
-    let engine = Arc::new(Mutex::new(Engine::new(recorder)));
-    engine.lock().unwrap().note(
+    let mut engine = Engine::new(recorder);
+    engine.enable_approvals();
+    let shared = Arc::new(Shared::new(engine));
+    shared.engine.lock().unwrap().note(
         "writd_start",
         json!({ "pid": std::process::id(), "socket": socket, "fsync": fsync }),
     );
@@ -216,12 +298,12 @@ pub fn run(socket: &Path, log: &Path, fsync: bool) -> anyhow::Result<()> {
         signal_hook::consts::SIGHUP,
     ])?;
     {
-        let (engine, socket, pid_path) = (engine.clone(), socket.to_path_buf(), pid_path.clone());
+        let (shared, socket, pid_path) = (shared.clone(), socket.to_path_buf(), pid_path.clone());
         thread::spawn(move || {
             if let Some(signal) = signals.forever().next() {
                 let _ = fs::remove_file(&socket);
                 let _ = fs::remove_file(&pid_path);
-                let mut engine = engine.lock().unwrap();
+                let mut engine = shared.engine.lock().unwrap();
                 let live = engine.tasks().len();
                 engine.note("writd_stop", json!({ "signal": signal, "live_tasks": live }));
                 // Exiting drops every connection: sessions lose their decision source and deny.
@@ -230,7 +312,7 @@ pub fn run(socket: &Path, log: &Path, fsync: bool) -> anyhow::Result<()> {
         });
     }
 
-    serve(listener, engine);
+    serve(listener, shared);
     drop(lock);
     Ok(())
 }

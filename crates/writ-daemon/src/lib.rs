@@ -14,7 +14,9 @@ pub mod server;
 use std::path::PathBuf;
 
 pub use client::Client;
-pub use engine::{Authority, Engine, EngineError, LoadedEntitlements, LoadedPolicy, TaskSummary};
+pub use engine::{
+    ApprovalSummary, Authority, Engine, EngineError, LoadedEntitlements, LoadedPolicy, Resolution, TaskSummary,
+};
 
 /// Environment variable carrying the task a process belongs to.
 pub const TASK_ENV: &str = "WRIT_TASK";

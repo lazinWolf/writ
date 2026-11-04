@@ -58,6 +58,22 @@ pub enum Request {
     },
     /// Returns `{"tasks": [TaskSummary]}`.
     Ps,
+    /// Returns `{"approvals": [ApprovalSummary]}`: pending approvals, oldest first.
+    ListApprovals,
+    /// Approves or denies a pending approval. `approver` describes who
+    /// (user, host); writd adds the peer's pid and uid. Returns the final
+    /// `writ_policy::Decision`.
+    ResolveApproval {
+        id: String,
+        approve: bool,
+        approver: Value,
+    },
+    /// Blocks until the approval is settled or times out, then returns the
+    /// final `writ_policy::Decision`. Send it on a connection of its own:
+    /// nothing else on that connection is answered meanwhile.
+    WaitApproval {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

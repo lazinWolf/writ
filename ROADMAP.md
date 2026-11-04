@@ -124,13 +124,21 @@ Each item is sized to be one PR. Start at the top.
 
 ### Step 6: Asynchronous decisions and a CLI approval broker (blocker 2, about 1 week)
 
-- [ ] Add `Outcome::Pending { approval_id }`. The engine records the pending decision durably and returns immediately.
-- [ ] In the proxy, stop holding `State` across `decide`. Park a pending call in `pending_approvals` and keep reading stdin, so other calls and results keep flowing. When the decision is resolved, forward the call or answer it with a tool error.
-- [ ] In writd, release the engine mutex while waiting. Add a `WaitApproval` request (or a push message on the session connection) that resolves when someone approves, denies, or the call times out.
-- [ ] Add `writ sudo list`, `writ sudo show <id>` (tool, redacted args, task facts, reason), and `writ sudo approve|deny <id>`. Record the approver's uid in the log.
-- [ ] Add a timeout (`approval_timeout` in policy, default 15m) after which the call is denied.
-- [ ] In standalone `writ wrap` (no writd), `require_sudo` keeps refusing with today's message. Document that approvals need writd.
-- [ ] Turn on the remaining `demo.rs` cases. **The hero demo now runs end to end.**
+- [x] Add a pending decision: `Decision.approval` carries the approval id on a `require_sudo` outcome. The engine records it durably and returns immediately.
+- [x] In the proxy, park a paused call on a thread of its own and keep reading stdin, so other calls and results keep flowing. When the decision is settled, forward the call or answer it with a tool error.
+- [x] In writd, release the engine mutex while waiting: a `WaitApproval` request, sent on a separate connection, sleeps on a condition variable until someone approves, denies, the call times out, or its task or session ends.
+- [x] Add `writ sudo list [--json]`, `writ sudo show <id>`, and `writ sudo approve|deny <id>`. Record the approver (user, plus the pid and uid writd sees) in the log.
+- [x] Add a timeout (`approvals: {timeout: 15m}` in policy, the default) after which the call is denied.
+- [x] In standalone `writ wrap` (no writd), or without an `approvals:` block, `require_sudo` keeps refusing. Document that approvals need writd.
+- [x] Turn on the remaining `demo.rs` cases. **The hero demo now runs end to end.**
+
+**Step 6 status:** done. Approvals are opt-in per policy (`approvals:`), so an existing policy never starts hanging. An approved call is re-checked (task live, limits) before it's forwarded, and each settlement (`approve`, `deny`, `timeout`, `cancelled`) is recorded durably. `writ sudo` refuses to run inside a task; that's a guard, not a boundary: same-user processes are trusted in cooperative mode. A simulated first-time operator and a simulated adversary exercised the flow by hand; their findings are folded in below.
+
+Follow-ups found while testing:
+- [ ] `writ sudo show` should keep answering after a decision (the outcome, who decided), not just "not waiting".
+- [ ] Show the looked-up record (e.g. the charge's customer) and which entitlements held in `writ sudo show`.
+- [ ] Approver identity is the local OS user, unauthenticated. Signed approvals (passkeys) and a Slack broker are Phase 2.
+- [ ] Precondition revalidation at approval time (plan-v2 §4.4: "charge not already refunded").
 
 ### Step 7: Policy replay (about 2 days; can run in parallel with steps 2–6)
 

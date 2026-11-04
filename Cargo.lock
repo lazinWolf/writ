@@ -513,6 +513,7 @@ name = "writ-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "humantime",
  "libc",
  "serde",
  "serde_json",
@@ -527,6 +528,7 @@ dependencies = [
 name = "writ-policy"
 version = "0.1.0"
 dependencies = [
+ "humantime",
  "serde",
  "serde_json",
  "serde_norway",

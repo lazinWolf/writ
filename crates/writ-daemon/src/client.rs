@@ -8,13 +8,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use writ_policy::Decision;
 
-use crate::engine::TaskSummary;
+use crate::engine::{ApprovalSummary, TaskSummary};
 use crate::protocol::{Request, Response};
 
 /// How long a request may take before the caller treats writd as unavailable.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Client {
+    socket: PathBuf,
     stream: UnixStream,
     reader: BufReader<UnixStream>,
 }
@@ -26,7 +27,11 @@ impl Client {
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
         let reader = BufReader::new(stream.try_clone()?);
-        Ok(Client { stream, reader })
+        Ok(Client {
+            socket: socket.to_path_buf(),
+            stream,
+            reader,
+        })
     }
 
     /// Connects, starting writd first if nothing is listening.
@@ -70,6 +75,34 @@ impl Client {
             Response::Ok { body } => Ok(body),
             Response::Error { message } => Err(anyhow!("writd: {message}")),
         }
+    }
+
+    /// The socket this client is connected to.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    pub fn list_approvals(&mut self) -> Result<Vec<ApprovalSummary>> {
+        let body = self.request(&Request::ListApprovals)?;
+        Ok(serde_json::from_value(body["approvals"].clone())?)
+    }
+
+    pub fn resolve_approval(&mut self, id: &str, approve: bool, approver: Value) -> Result<Decision> {
+        let body = self.request(&Request::ResolveApproval {
+            id: id.to_string(),
+            approve,
+            approver,
+        })?;
+        Ok(serde_json::from_value(body)?)
+    }
+
+    /// Waits for approval `id` to be settled. Use a connection of its own:
+    /// it blocks until a human decides or the approval times out, so the
+    /// usual request timeout doesn't apply.
+    pub fn wait_approval(mut self, id: &str) -> Result<Decision> {
+        self.stream.set_read_timeout(None)?;
+        let body = self.request(&Request::WaitApproval { id: id.to_string() })?;
+        Ok(serde_json::from_value(body)?)
     }
 
     pub fn create_task(

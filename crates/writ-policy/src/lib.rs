@@ -20,6 +20,7 @@ mod redact;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,7 +43,7 @@ pub enum PolicyError {
 }
 
 /// Spec fields that are part of writ.yaml but not enforced by this build.
-const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &["approvals"];
+const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &[];
 const UNIMPLEMENTED_DATA_FLOW: &[&str] = &["secrets", "pii_fields", "declassify"];
 const UNIMPLEMENTED_ON_TAINT: &[&str] = &["other_mutations", "egress_to_untrusted_sinks"];
 const UNIMPLEMENTED_LIMITS: &[&str] = &["max_depth", "max_parallel_agents", "max_budget_usd", "loop_breaker"];
@@ -97,7 +98,33 @@ pub struct Decision {
     /// Pattern of the rule that produced the outcome; `None` for deny-by-default.
     pub rule: Option<String>,
     pub reason: String,
+    /// For `require_sudo` under writd with approvals on: the pending
+    /// approval the call waits for (`writ sudo approve <id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
+
+impl Decision {
+    pub fn new(outcome: Outcome, rule: Option<String>, reason: String) -> Self {
+        Decision {
+            outcome,
+            rule,
+            reason,
+            approval: None,
+        }
+    }
+}
+
+/// The policy's `approvals:` block: `require_sudo` calls pause for a human
+/// instead of being refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Approvals {
+    /// How long a paused call waits before it is denied.
+    pub timeout: Duration,
+}
+
+/// The default `approvals.timeout`.
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Default)]
 pub struct Limits {
@@ -154,6 +181,8 @@ pub struct Policy {
     on_taint_privileged: Outcome,
     /// Where `writ.root.*` and lookups come from, if anywhere.
     pub entitlements: Option<EntitlementsSpec>,
+    /// Present when `require_sudo` calls should wait for a human.
+    pub approvals: Option<Approvals>,
     rules: Vec<Rule>,
     fallback: Option<Rule>,
 }
@@ -172,7 +201,16 @@ struct RawPolicy {
     #[serde(default)]
     entitlements: Option<EntitlementsSpec>,
     #[serde(default)]
+    approvals: Option<RawApprovals>,
+    #[serde(default)]
     capabilities: Vec<RawRule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApprovals {
+    /// A duration such as `15m` or `90s`.
+    timeout: Option<String>,
 }
 
 /// The policy's `entitlements:` block.
@@ -310,6 +348,20 @@ impl Policy {
                 TaintAction::Deny => Outcome::Deny,
             },
             entitlements: raw.entitlements,
+            approvals: raw
+                .approvals
+                .map(|a| -> Result<Approvals, PolicyError> {
+                    let timeout = match a.timeout {
+                        None => DEFAULT_APPROVAL_TIMEOUT,
+                        Some(t) => humantime::parse_duration(&t)
+                            .map_err(|e| invalid(format!("approvals.timeout `{t}`: {e}")))?,
+                    };
+                    if timeout.is_zero() {
+                        return Err(invalid("approvals.timeout must be more than zero".to_string()));
+                    }
+                    Ok(Approvals { timeout })
+                })
+                .transpose()?,
             limits: Limits {
                 max_tool_calls: raw.limits.max_tool_calls,
             },
@@ -323,11 +375,11 @@ impl Policy {
         let tool = ctx.tool;
         let candidates = self.candidates(tool);
         if candidates.is_empty() {
-            return Decision {
-                outcome: Outcome::Deny,
-                rule: None,
-                reason: format!("no rule matches tool `{tool}` (deny by default)"),
-            };
+            return Decision::new(
+                Outcome::Deny,
+                None,
+                format!("no rule matches tool `{tool}` (deny by default)"),
+            );
         }
 
         let recording = Self::recording(&candidates);
@@ -353,14 +405,14 @@ impl Policy {
             .find(|(rule, (_, covered))| rule.privileged && !covered)
             .map(|(rule, _)| rule);
         match uncovered {
-            Some(rule) if ctx.facts.tainted && self.on_taint_privileged > best.outcome => Decision {
-                outcome: self.on_taint_privileged,
-                rule: Some(rule.pattern.clone()),
-                reason: format!(
+            Some(rule) if ctx.facts.tainted && self.on_taint_privileged > best.outcome => Decision::new(
+                self.on_taint_privileged,
+                Some(rule.pattern.clone()),
+                format!(
                     "`{tool}` is privileged and the task is tainted (it read from {})",
                     ctx.facts.taint_sources.join(", ")
                 ),
-            },
+            ),
             _ => best,
         }
     }
@@ -495,14 +547,7 @@ impl Rule {
         let rule = Some(self.pattern.clone());
         if self.action == Action::Deny {
             let reason = format!("denied by rule `{}`", self.pattern);
-            return (
-                Decision {
-                    outcome: Outcome::Deny,
-                    rule,
-                    reason,
-                },
-                false,
-            );
+            return (Decision::new(Outcome::Deny, rule, reason), false);
         }
 
         // Bind lookups. A miss leaves the name unbound, so every condition
@@ -557,15 +602,19 @@ impl Rule {
             if let Err(reason) = entitlement.check(&scope) {
                 let reason = format!("outside the root's entitlement: {}", explain(entitlement, reason));
                 let outcome = outcome_of(self.on_entitlement_violation);
-                return (Decision { outcome, rule, reason }, false);
+                return (Decision::new(outcome, rule, reason), false);
             }
         }
         let covered = !self.entitlements.is_empty();
         for condition in &self.conditions {
             if let Err(reason) = condition.check(&scope) {
-                let reason = explain(condition, reason);
+                let mut reason = explain(condition, reason);
+                if covered {
+                    // Tell whoever reviews it that the call is the root's own business.
+                    reason.push_str(" (within the root's entitlement)");
+                }
                 let outcome = outcome_of(self.on_violation);
-                return (Decision { outcome, rule, reason }, covered);
+                return (Decision::new(outcome, rule, reason), covered);
             }
         }
         let reason = if covered {
@@ -573,14 +622,7 @@ impl Rule {
         } else {
             format!("allowed by rule `{}`", self.pattern)
         };
-        (
-            Decision {
-                outcome: Outcome::Allow,
-                rule,
-                reason,
-            },
-            covered,
-        )
+        (Decision::new(Outcome::Allow, rule, reason), covered)
     }
 }
 
@@ -727,7 +769,10 @@ capabilities:
                 "version: 1\nnamespace: t\ndata_flow:\n  on_taint:\n    other_mutations: allow_within_limits\n",
                 "data_flow.on_taint.other_mutations",
             ),
-            ("version: 1\nnamespace: t\napprovals: {}\n", "approvals"),
+            (
+                "version: 1\nnamespace: t\nlimits:\n  loop_breaker: strict\n",
+                "limits.loop_breaker",
+            ),
             (
                 "version: 1\nnamespace: t\nlimits:\n  max_depth: 4\n",
                 "limits.max_depth",
@@ -1052,6 +1097,22 @@ tables:
         let d = redacting.evaluate(&DecisionContext::new("stripe.refund", &unknown, &facts).with_source(Some(&source)));
         assert_eq!(d.outcome, Outcome::Deny);
         assert!(!d.reason.contains("ch_nope"), "{}", d.reason);
+    }
+
+    #[test]
+    fn approvals_block() {
+        let base = "version: 1\nnamespace: t\n";
+        assert_eq!(Policy::from_yaml_str(base).unwrap().approvals, None);
+        let p = Policy::from_yaml_str(&format!("{base}approvals: {{}}\n")).unwrap();
+        assert_eq!(p.approvals.unwrap().timeout, DEFAULT_APPROVAL_TIMEOUT);
+        let p = Policy::from_yaml_str(&format!("{base}approvals:\n  timeout: 90s\n")).unwrap();
+        assert_eq!(p.approvals.unwrap().timeout, Duration::from_secs(90));
+        for bad in ["timeout: soon", "timeout: 0s", "approvers: [bob]"] {
+            assert!(
+                Policy::from_yaml_str(&format!("{base}approvals:\n  {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
