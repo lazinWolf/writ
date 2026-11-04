@@ -81,7 +81,7 @@ def main():
     out = os.environ.get("DRIVER_OUT")
     if out:
         with open(out, "w") as f:
-            json.dump({"results": results, "exits": exits, "task": os.environ.get("WRIT_TASK")}, f)
+            json.dump({"results": results, "exits": exits, "task": os.environ.get("WRIT_TASK_ID")}, f)
 
 
 if __name__ == "__main__":

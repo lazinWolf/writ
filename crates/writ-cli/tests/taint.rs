@@ -52,6 +52,7 @@ fn wrap(dir: &Path, extra: &[&str], calls: &[String]) -> Output {
         .arg(fixture())
         .env("FAKE_MCP_LOG", dir.join("server.log"))
         .env_remove("WRIT_TASK")
+        .env_remove("WRIT_TOKEN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

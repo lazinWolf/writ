@@ -11,6 +11,13 @@ use writ_policy::Decision;
 use crate::engine::{ApprovalSummary, TaskSummary};
 use crate::protocol::{Request, Response};
 
+/// A task writd created: its id names it, its token joins it.
+#[derive(Debug, Clone)]
+pub struct NewTask {
+    pub task: String,
+    pub token: String,
+}
+
 /// How long a request may take before the caller treats writd as unavailable.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -110,15 +117,20 @@ impl Client {
         policy: &str,
         entitlements: Option<&str>,
         principal: Option<&str>,
+        ttl: Option<std::time::Duration>,
         meta: Value,
-    ) -> Result<String> {
+    ) -> Result<NewTask> {
         let body = self.request(&Request::CreateTask {
             policy: policy.to_string(),
             entitlements: entitlements.map(str::to_string),
             principal: principal.map(str::to_string),
+            ttl_secs: ttl.map(|t| t.as_secs()),
             meta,
         })?;
-        string_field(&body, "task")
+        Ok(NewTask {
+            task: string_field(&body, "task")?,
+            token: string_field(&body, "token")?,
+        })
     }
 
     pub fn end_task(&mut self, task: &str) -> Result<()> {
@@ -128,14 +140,15 @@ impl Client {
 
     pub fn open_session(
         &mut self,
-        task: Option<&str>,
+        token: Option<&str>,
         policy: Option<&str>,
         entitlements: Option<&str>,
         name: &str,
         info: Value,
     ) -> Result<String> {
         let body = self.request(&Request::OpenSession {
-            task: task.map(str::to_string),
+            token: token.map(str::to_string),
+            task: None,
             policy: policy.map(str::to_string),
             entitlements: entitlements.map(str::to_string),
             name: name.to_string(),

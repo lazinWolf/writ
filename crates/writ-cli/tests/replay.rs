@@ -36,7 +36,9 @@ fn call(id: u64, tool: &str, args: Value) -> String {
 
 fn writ(log: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
-    cmd.env("WRIT_LOG", log).env_remove("WRIT_TASK");
+    cmd.env("WRIT_LOG", log)
+        .env_remove("WRIT_TASK")
+        .env_remove("WRIT_TOKEN");
     cmd
 }
 

@@ -49,7 +49,7 @@ def main():
     results.append(("b", b.call("postgres.query", {"sql": "select 3"})))
     exits = [a.close(), b.close()]
     with open(os.environ["DRIVER_OUT"], "w") as f:
-        json.dump({"results": results, "ps": ps, "exits": exits, "task": os.environ.get("WRIT_TASK")}, f)
+        json.dump({"results": results, "ps": ps, "exits": exits, "task": os.environ.get("WRIT_TASK_ID")}, f)
 
 
 if __name__ == "__main__":

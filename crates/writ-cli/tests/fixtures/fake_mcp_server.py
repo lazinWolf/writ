@@ -9,6 +9,9 @@ $FAKE_MCP_MODE selects misbehaviour for shutdown tests:
   close_stdout  close stdout at startup but keep running
   grandchild    start a `sleep` that inherits stdout, then behave normally;
                 its pid is written to the log as "GRANDCHILD <pid>"
+
+With $FAKE_MCP_REPORT_ENV set, the names of WRIT_* variables in its
+environment are written to the log at startup as "ENV <names>".
 """
 
 import json
@@ -60,6 +63,8 @@ def handle(msg):
 
 def main():
     mode = os.environ.get("FAKE_MCP_MODE", "")
+    if os.environ.get("FAKE_MCP_REPORT_ENV"):
+        log("ENV " + " ".join(sorted(k for k in os.environ if k.startswith("WRIT_"))) + "\n")
     if mode == "stubborn":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if mode == "grandchild":

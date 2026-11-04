@@ -14,6 +14,7 @@ writ-recorder = { path = "crates/writ-recorder" }
 writ-daemon = { path = "crates/writ-daemon" }
 writ-proxy = { path = "crates/writ-proxy" }
 anyhow = "1"
+biscuit-auth = { version = "6", default-features = false, features = ["datalog-macro"] }
 clap = { version = "4.6", features = ["derive"] }
 humantime = "2.4"
 libc = "0.2"

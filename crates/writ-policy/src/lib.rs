@@ -4,7 +4,7 @@
 //! rules with conditions over the call's arguments (`args.*`) and the task's
 //! facts (`writ.*`, see [`Facts`]), entitlements checked against an
 //! entitlement source (see [`entitlements`]), coarse taint, and the
-//! `max_tool_calls` limit. Fields the
+//! `max_tool_calls` and `max_depth` limits. Fields the
 //! spec defines but this build does not enforce are rejected at load time, so
 //! a policy never appears to grant a guarantee it does not have.
 //!
@@ -46,7 +46,7 @@ pub enum PolicyError {
 const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &[];
 const UNIMPLEMENTED_DATA_FLOW: &[&str] = &["secrets", "pii_fields", "declassify"];
 const UNIMPLEMENTED_ON_TAINT: &[&str] = &["other_mutations", "egress_to_untrusted_sinks"];
-const UNIMPLEMENTED_LIMITS: &[&str] = &["max_depth", "max_parallel_agents", "max_budget_usd", "loop_breaker"];
+const UNIMPLEMENTED_LIMITS: &[&str] = &["max_parallel_agents", "max_budget_usd", "loop_breaker"];
 const UNIMPLEMENTED_RULE: &[&str] = &[
     "idempotency",
     "preconditions",
@@ -129,6 +129,9 @@ pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 #[derive(Debug, Clone, Default)]
 pub struct Limits {
     pub max_tool_calls: Option<u64>,
+    /// How many times a task's token may be forked (`writ fork`) below the
+    /// root. Checked by writd when a session opens; 0 forbids forking.
+    pub max_depth: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +266,7 @@ enum TaintAction {
 #[serde(deny_unknown_fields)]
 struct RawLimits {
     max_tool_calls: Option<u64>,
+    max_depth: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -364,6 +368,7 @@ impl Policy {
                 .transpose()?,
             limits: Limits {
                 max_tool_calls: raw.limits.max_tool_calls,
+                max_depth: raw.limits.max_depth,
             },
             rules,
             fallback,
@@ -774,8 +779,8 @@ capabilities:
                 "limits.loop_breaker",
             ),
             (
-                "version: 1\nnamespace: t\nlimits:\n  max_depth: 4\n",
-                "limits.max_depth",
+                "version: 1\nnamespace: t\nlimits:\n  max_parallel_agents: 4\n",
+                "limits.max_parallel_agents",
             ),
             (
                 "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    preconditions: []\n",

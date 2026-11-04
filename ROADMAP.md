@@ -154,11 +154,38 @@ Follow-ups:
 
 ### Step 8: Signed task tokens (after the demo, about 1–2 weeks)
 
-- [ ] Replace `WRIT_TASK` with a Biscuit token minted by writd, carrying task ID, namespace, policy hash, root principal and expiry.
-- [ ] `writ wrap` presents the token, and writd verifies it. Unsigned IDs are rejected.
-- [ ] Add `writ fork` (CLI first): attenuate a token with a narrower policy. This is the basis for `max_depth`.
-- [ ] Strip writ material from anything forwarded to a wrapped server (plan-v2 §4.1, token exposure).
-- [ ] Update the README's "Not yet a security boundary between processes" section to match what's true after this change.
+- [x] Replace `WRIT_TASK` with a Biscuit token minted by writd, carrying task ID, namespace, policy hash, root principal and expiry.
+- [x] `writ wrap` presents the token, and writd verifies it. Unsigned IDs are rejected.
+- [x] Add `writ fork` (CLI first): attenuate a token with a narrower policy. This is the basis for `max_depth`.
+- [x] Strip writ material from anything forwarded to a wrapped server (plan-v2 §4.1, token exposure).
+- [x] Update the README's "Not yet a security boundary between processes" section to match what's true after this change.
+
+**Step 8 status:** done, pending an outside review of the token design (owner track). The token is `biscuit-auth` 6 (`crates/writ-daemon/src/token.rs`):
+- **Minting and verifying.** writd signs the authority block with an Ed25519 key held only in memory, so restarting writd invalidates every token. `writ run` passes the token as `WRIT_TOKEN` and the id as `WRIT_TASK_ID`, which is for display only. writd refuses `OpenSession` with a bare task id, and `writ wrap` refuses a leftover `WRIT_TASK`. Only the authority block is trusted for the task, namespace, policy hash and principal; a fork that claims another task is ignored (unit-tested). `EndTask` now only works on the connection that created the task.
+- **Forking.** `writ fork` works offline. It appends a block carrying `writ_fork(depth, label, policy-bytes)`, plus a `check if time` when given `--ttl`. writd uses fork blocks only to narrow:
+  - Each fork's policy joins the D9 evaluation.
+  - A fork's `max_tool_calls` is counted per fork, by the block's revocation id, across all of that fork's sessions.
+  - `limits.max_depth` is implemented and checked when a session opens.
+  - The session's expiry is the earliest of all its blocks.
+- **Exposure.**
+  - `writ wrap` drops `WRIT_TOKEN` and `WRIT_TASK` from the server's environment and strips `_meta` keys under `writ/`.
+  - A message containing the token is refused rather than forwarded.
+  - The log records the token's fingerprint and lineage, never the token itself.
+- **Tested** end to end in `tests/tokens.rs`:
+  - forked narrowing, and the fork limit shared across two servers;
+  - the parent keeping its own authority;
+  - `max_depth`;
+  - a one-character tamper;
+  - the server's environment;
+  - the leak refusal;
+  - no tokens in the log.
+
+Follow-ups:
+- [ ] Outside security review of the token design (owner track, §6).
+- [ ] Replay doesn't apply fork policies: the log stores their hashes, not their text (same fix as the step 7 narrowing follow-up).
+- [ ] Carry tokens per call in MCP `_meta` for in-process sub-agents that share one server connection, verified by `writ wrap`.
+- [ ] Proof of possession, and audience-bound edge tokens (RFC 8693) for anything that leaves the machine.
+- [ ] The token-in-message check matches the exact token only. An agent that splits or re-encodes the token gets past it. A boundary needs mediated mode.
 
 ---
 

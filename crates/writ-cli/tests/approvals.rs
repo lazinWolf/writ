@@ -61,7 +61,8 @@ fn paused_calls_wait_for_a_human_without_blocking_others() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
         cmd.env("WRIT_SOCKET", path("run/writd.sock"))
             .env("WRIT_LOG", path("flight.jsonl"))
-            .env_remove("WRIT_TASK");
+            .env_remove("WRIT_TASK")
+            .env_remove("WRIT_TOKEN");
         cmd
     };
 
@@ -121,7 +122,7 @@ fn paused_calls_wait_for_a_human_without_blocking_others() {
             .unwrap()
             .contains("inside a writ task")
     );
-    // Hiding WRIT_TASK doesn't help: writd sees the caller descends from the task's `writ run`.
+    // Hiding WRIT_TOKEN doesn't help: writd sees the caller descends from the task's `writ run`.
     assert_eq!(driver["self_approve_unset"]["code"], 2, "{driver}");
     assert!(
         driver["self_approve_unset"]["stderr"]
@@ -179,7 +180,8 @@ fn stopping_writd_settles_waiting_calls_in_the_log() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
         cmd.env("WRIT_SOCKET", path("run/writd.sock"))
             .env("WRIT_LOG", path("flight.jsonl"))
-            .env_remove("WRIT_TASK");
+            .env_remove("WRIT_TASK")
+            .env_remove("WRIT_TOKEN");
         cmd
     };
     let agent = writ()

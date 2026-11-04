@@ -60,7 +60,8 @@ impl Env {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
         cmd.env("WRIT_SOCKET", self.socket())
             .env("WRIT_LOG", self.path("flight.jsonl"))
-            .env_remove("WRIT_TASK");
+            .env_remove("WRIT_TASK")
+            .env_remove("WRIT_TOKEN");
         cmd
     }
 
@@ -229,9 +230,9 @@ fn run_shares_limits_across_servers_and_narrowing_only_restricts() {
 fn wrap_refuses_to_run_when_its_task_cannot_be_enforced() {
     require_python!();
     let env = Env::new();
-    let wrap = |env: &Env| {
+    let wrap = |env: &Env, var: &str, value: &str| {
         env.writ()
-            .env("WRIT_TASK", "tsk_does_not_exist")
+            .env(var, value)
             .args(["wrap", "--", "python3", "-I"])
             .arg(fixture("fake_mcp_server.py"))
             .env("FAKE_MCP_LOG", env.path("server.log"))
@@ -240,16 +241,22 @@ fn wrap_refuses_to_run_when_its_task_cannot_be_enforced() {
             .unwrap()
     };
 
+    // A bare task id (what earlier builds used) is refused, not ignored.
+    let out = wrap(&env, "WRIT_TASK", "tsk_does_not_exist");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("no longer join a task"), "{}", stderr(&out));
+
     // No writd at all.
-    let out = wrap(&env);
+    let out = wrap(&env, "WRIT_TOKEN", "not-a-token");
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("refusing to run the server"), "{}", stderr(&out));
 
-    // writd is up, but the task is unknown.
+    // writd is up, but the token isn't one.
     env.start_writd();
-    let out = wrap(&env);
+    let out = wrap(&env, "WRIT_TOKEN", "not-a-token");
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("unknown task"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("not a writ token"), "{}", stderr(&out));
+    assert!(!env.path("server.log").exists(), "the server must not have started");
 }
 
 #[test]

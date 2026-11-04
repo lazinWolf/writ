@@ -11,7 +11,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Create a root task from policy text. Returns `{"task": id}`.
+    /// Create a root task from policy text. Returns `{"task": id, "token": writ}`:
+    /// the token is what joins the task; the id only names it.
     CreateTask {
         policy: String,
         /// The text of the policy's entitlement source, if it declares one.
@@ -21,13 +22,24 @@ pub enum Request {
         /// The root principal (unverified).
         #[serde(default)]
         principal: Option<String>,
+        /// How long the token is valid. Defaults to `token::DEFAULT_TTL`.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
         meta: Value,
     },
+    /// Ends a task this connection created.
     EndTask {
         task: String,
     },
     /// Open this connection's session. Returns `{"session": id}`.
     OpenSession {
+        /// The task's writ token (`WRIT_TOKEN`), possibly forked. Without one
+        /// the session gets an implicit task from `policy`.
+        #[serde(default)]
+        token: Option<String>,
+        /// Refused: a bare task id carries no authority. Kept so an old
+        /// client gets an error instead of a session outside its task.
+        #[serde(default)]
         task: Option<String>,
         policy: Option<String>,
         /// The wrapped server's name; the session is `mcp:<name>`.

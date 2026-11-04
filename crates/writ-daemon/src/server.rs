@@ -3,7 +3,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -137,6 +137,7 @@ impl Connection {
                 policy,
                 entitlements,
                 principal,
+                ttl_secs,
                 meta,
             } => {
                 let authority = Authority {
@@ -148,14 +149,22 @@ impl Connection {
                     engine.set_task_process(&task, pid);
                 }
                 self.tasks.push(task.clone());
-                Ok(json!({ "task": task }))
+                let ttl = ttl_secs.map_or(crate::token::DEFAULT_TTL, Duration::from_secs);
+                let token = engine.task_token(&task, ttl)?;
+                Ok(json!({ "task": task, "token": token }))
             }
             Request::EndTask { task } => {
+                if !self.tasks.contains(&task) {
+                    return Err(EngineError::Invalid(format!(
+                        "task `{task}` wasn't created on this connection; only its creator can end it"
+                    )));
+                }
                 engine.end_task(&task, "ended by creator")?;
                 self.tasks.retain(|t| t != &task);
                 Ok(Value::Null)
             }
             Request::OpenSession {
+                token,
                 task,
                 policy,
                 name,
@@ -165,14 +174,18 @@ impl Connection {
                 if self.session.is_some() {
                     return Err(EngineError::Invalid("this connection already has a session".into()));
                 }
+                if let Some(task) = task {
+                    return Err(EngineError::Invalid(format!(
+                        "refusing to join task `{task}` by id: task ids carry no authority. \
+                         Present the task's writ token (WRIT_TOKEN, set by `writ run`)."
+                    )));
+                }
                 let policy = policy.as_deref().map(LoadedPolicy::parse).transpose()?;
-                let session = engine.open_session(
-                    task.as_deref(),
-                    policy,
-                    entitlements.as_deref().map(LoadedEntitlements::parse).transpose()?,
-                    &name,
-                    info,
-                )?;
+                let entitlements = entitlements.as_deref().map(LoadedEntitlements::parse).transpose()?;
+                let session = match token {
+                    Some(token) => engine.open_session_with_token(&token, policy, entitlements, &name, info)?,
+                    None => engine.open_session(None, policy, entitlements, &name, info)?,
+                };
                 if let Some(pid) = self.peer_pid {
                     engine.set_session_process(&session, pid);
                 }

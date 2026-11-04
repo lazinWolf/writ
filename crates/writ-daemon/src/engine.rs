@@ -23,6 +23,8 @@ use writ_policy::{
 };
 use writ_recorder::{Recorder, RecorderError};
 
+use crate::token::{self, Claims, Issuer, TokenError};
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -33,6 +35,8 @@ pub enum EngineError {
     UnknownSession(String),
     #[error("{0}")]
     Invalid(String),
+    #[error(transparent)]
+    Token(#[from] TokenError),
 }
 
 /// A policy together with the hash of the exact text it was parsed from.
@@ -133,6 +137,33 @@ struct Task {
     /// The process that created the task (`writ run`), if known. It and its
     /// descendants (the agent) must not decide the task's approvals.
     creator_pid: Option<i32>,
+    /// Allowed calls per fork, by fork id, across every session it reached.
+    fork_calls: BTreeMap<String, u64>,
+}
+
+/// A policy that narrows a session: from a fork in its token, or its own
+/// (`writ wrap --policy` under a task).
+#[derive(Debug, Clone)]
+struct Narrowing {
+    policy: LoadedPolicy,
+    /// The fork's id, if from one: its limits count calls from every session
+    /// the fork reached, not just this one.
+    fork: Option<String>,
+    /// How decisions name it: "session policy", "fork `billing` policy".
+    name: String,
+}
+
+/// What a verified token entitles a session to.
+struct Grant {
+    task: String,
+    /// The forks' policies, oldest first.
+    narrowing: Vec<Narrowing>,
+    /// Every fork's id, oldest first, whether or not it carries a policy.
+    forks: Vec<String>,
+    /// Unix seconds.
+    expires: Option<u64>,
+    /// What the session record says about the token.
+    lineage: Value,
 }
 
 /// A `require_sudo` call paused until a human decides, it times out, or its
@@ -186,7 +217,13 @@ struct Session {
     task: String,
     /// `mcp:<name>`.
     source: String,
-    policy: Option<LoadedPolicy>,
+    /// Forks' policies, oldest first, then the session's own: each can only
+    /// make a decision stricter.
+    narrowing: Vec<Narrowing>,
+    /// The token's fork ids, oldest first.
+    forks: Vec<String>,
+    /// When the token this session opened with expires, Unix seconds.
+    expires: Option<u64>,
     counters: Counters,
     /// The `writ wrap` process serving this session, if known. It and its
     /// descendants (the MCP server) must not decide the task's approvals.
@@ -224,11 +261,14 @@ pub struct Engine {
     approvals: BTreeMap<String, Approval>,
     tasks: BTreeMap<String, Task>,
     sessions: BTreeMap<String, Session>,
+    /// Signs task tokens. Its key lives only in this process.
+    issuer: Issuer,
 }
 
 impl Engine {
     pub fn new(recorder: Recorder) -> Self {
         Engine {
+            issuer: Issuer::default(),
             recorder,
             approvals_enabled: false,
             approvals: BTreeMap::new(),
@@ -301,9 +341,101 @@ impl Engine {
                 implicit,
                 ended: false,
                 creator_pid: None,
+                fork_calls: BTreeMap::new(),
             },
         );
         Ok(id)
+    }
+
+    /// Mints the token that lets processes join `task`, valid for `ttl`.
+    /// Only its fingerprint is recorded.
+    pub fn task_token(&mut self, task_id: &str, ttl: Duration) -> Result<String, EngineError> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| EngineError::UnknownTask(task_id.to_string()))?;
+        let claims = Claims {
+            task: task_id.to_string(),
+            namespace: task.policy.policy.namespace.clone(),
+            policy_sha256: task.policy.sha256.clone(),
+            principal: task.facts.root.as_ref().map(|r| r.principal.clone()),
+            expires: token::now().saturating_add(ttl.as_secs()),
+        };
+        let token = self.issuer.mint(&claims)?;
+        self.recorder.append(
+            task_id,
+            "token_issued",
+            json!({ "task": task_id, "token": token::fingerprint(&token), "expires": claims.expires }),
+        )?;
+        Ok(token)
+    }
+
+    /// Checks a token and what it grants: signed by this writd, unexpired,
+    /// for a live task whose namespace and policy it names, with fork
+    /// policies that parse, bring no entitlement source, and stay within
+    /// every `max_depth`.
+    fn grant(&self, token: &str) -> Result<Grant, EngineError> {
+        let verified = self.issuer.verify(token)?;
+        let claims = &verified.claims;
+        let task = self
+            .tasks
+            .get(&claims.task)
+            .ok_or_else(|| EngineError::UnknownTask(claims.task.clone()))?;
+        if task.ended {
+            return Err(EngineError::Invalid(format!("task `{}` has ended", claims.task)));
+        }
+        if claims.namespace != task.policy.policy.namespace || claims.policy_sha256 != task.policy.sha256 {
+            return Err(TokenError::Refused("it doesn't match its task's namespace and policy".into()).into());
+        }
+        let mut narrowing = Vec::new();
+        for (depth, fork) in verified.forks.iter().enumerate() {
+            for text in &fork.policies {
+                let name = match &fork.label {
+                    Some(label) => format!("fork `{label}` policy"),
+                    None => format!("fork {} policy", depth + 1),
+                };
+                let policy = LoadedPolicy::parse(text).map_err(|e| EngineError::Invalid(format!("{name}: {e}")))?;
+                if policy.policy.entitlements.is_some() {
+                    return Err(EngineError::Invalid(format!(
+                        "{name} declares an entitlement source; a fork reads the task's"
+                    )));
+                }
+                check_tables(&policy.policy, task.source.as_deref())?;
+                narrowing.push(Narrowing {
+                    policy,
+                    fork: Some(fork.id.clone()),
+                    name,
+                });
+            }
+        }
+        let depth = verified.forks.len() as u64;
+        if let Some(max) = std::iter::once(&task.policy)
+            .chain(narrowing.iter().map(|n| &n.policy))
+            .filter_map(|p| p.policy.limits.max_depth)
+            .min()
+            && depth > max
+        {
+            return Err(EngineError::Invalid(format!(
+                "the token is forked {depth} deep; the policy allows max_depth {max}"
+            )));
+        }
+        Ok(Grant {
+            task: claims.task.clone(),
+            narrowing,
+            forks: verified.forks.iter().map(|f| f.id.clone()).collect(),
+            expires: Some(verified.expires),
+            lineage: json!({
+                "token": verified.fingerprint,
+                "depth": depth,
+                "expires": verified.expires,
+                "forks": verified.forks.iter().map(|f| json!({
+                    "id": f.id,
+                    "label": f.label,
+                    "policy_sha256": f.policies.iter().map(|p| writ_recorder::sha256_hex(p.as_bytes())).collect::<Vec<_>>(),
+                    "expires": f.expires,
+                })).collect::<Vec<_>>(),
+            }),
+        })
     }
 
     /// Records the process that created `task`. It and its descendants (the
@@ -379,10 +511,44 @@ impl Engine {
         name: &str,
         info: Value,
     ) -> Result<String, EngineError> {
+        // In-process callers are trusted with the task id; writd's peers present a token.
+        let grant = task.map(|task| Grant {
+            task: task.to_string(),
+            narrowing: Vec::new(),
+            forks: Vec::new(),
+            expires: None,
+            lineage: Value::Null,
+        });
+        self.open(grant, own_policy, own_entitlements, name, info)
+    }
+
+    /// Like [`Engine::open_session`] with a task, but the task comes from a
+    /// token, which is verified first. Its forks' policies narrow the session.
+    pub fn open_session_with_token(
+        &mut self,
+        token: &str,
+        own_policy: Option<LoadedPolicy>,
+        own_entitlements: Option<LoadedEntitlements>,
+        name: &str,
+        info: Value,
+    ) -> Result<String, EngineError> {
+        let grant = self.grant(token)?;
+        self.open(Some(grant), own_policy, own_entitlements, name, info)
+    }
+
+    fn open(
+        &mut self,
+        grant: Option<Grant>,
+        mut own_policy: Option<LoadedPolicy>,
+        own_entitlements: Option<LoadedEntitlements>,
+        name: &str,
+        info: Value,
+    ) -> Result<String, EngineError> {
         writ_policy::validate_session_name(name).map_err(EngineError::Invalid)?;
         let source = writ_policy::session_source(name);
-        let (task_id, session_policy) = match task {
-            Some(id) => {
+        let (task_id, mut narrowing, forks, expires, lineage) = match grant {
+            Some(grant) => {
+                let id = &grant.task;
                 let task = self
                     .tasks
                     .get(id)
@@ -400,26 +566,39 @@ impl Engine {
                     }
                     check_tables(&own.policy, task.source.as_deref())?;
                 }
-                (id.to_string(), own_policy)
+                (grant.task, grant.narrowing, grant.forks, grant.expires, grant.lineage)
             }
             None => {
                 let policy = own_policy
+                    .take()
                     .ok_or_else(|| EngineError::Invalid("a session without a task needs its own policy".into()))?;
                 let authority = Authority {
                     principal: None,
                     entitlements: own_entitlements,
                 };
-                (self.create_task_inner(policy, authority, json!({}), true)?, None)
+                let task = self.create_task_inner(policy, authority, json!({}), true)?;
+                (task, Vec::new(), Vec::new(), None, Value::Null)
             }
         };
+        if let Some(policy) = own_policy {
+            narrowing.push(Narrowing {
+                policy,
+                fork: None,
+                name: "session policy".into(),
+            });
+        }
 
         let id = new_id("ses");
-        let data = json!({
+        let own = narrowing.iter().find(|n| n.fork.is_none());
+        let mut data = json!({
             "task": task_id,
             "source": source,
-            "narrowing_policy_sha256": session_policy.as_ref().map(|p| &p.sha256),
+            "narrowing_policy_sha256": own.map(|n| &n.policy.sha256),
             "info": info,
         });
+        if !lineage.is_null() {
+            data["writ"] = lineage;
+        }
         self.recorder.append_durable(&id, "session_start", data)?;
         self.tasks
             .get_mut(&task_id)
@@ -431,7 +610,9 @@ impl Engine {
             Session {
                 task: task_id,
                 source,
-                policy: session_policy,
+                narrowing,
+                forks,
+                expires,
                 counters: Counters::default(),
                 pid: None,
             },
@@ -471,23 +652,25 @@ impl Engine {
                 None,
                 format!("task `{}` has ended; its authority is revoked", session.task),
             )
+        } else if session.expires.is_some_and(|e| token::now() > e) {
+            Decision::new(
+                Outcome::Deny,
+                None,
+                "the writ token this session opened with has expired".to_string(),
+            )
         } else {
-            let from_task = task.policy.policy.evaluate(&ctx);
-            match &session.policy {
-                // Ties keep the task's decision: the narrowing policy only matters when stricter.
-                Some(own) => {
-                    let from_session = own.policy.evaluate(&ctx);
-                    if from_session.outcome > from_task.outcome {
-                        Decision {
-                            reason: format!("{} (session policy)", from_session.reason),
-                            ..from_session
-                        }
-                    } else {
-                        from_task
-                    }
+            // Ties keep the earlier decision: a narrowing policy only matters when stricter.
+            let mut decision = task.policy.policy.evaluate(&ctx);
+            for narrowing in &session.narrowing {
+                let narrower = narrowing.policy.policy.evaluate(&ctx);
+                if narrower.outcome > decision.outcome {
+                    decision = Decision {
+                        reason: format!("{} ({})", narrower.reason, narrowing.name),
+                        ..narrower
+                    };
                 }
-                None => from_task,
             }
+            decision
         };
         if decision.outcome == Outcome::Allow
             && let Some(reason) = limit_reached(task, session)
@@ -508,14 +691,12 @@ impl Engine {
             "decision": decision,
             "facts": facts,
         });
-        // The narrowing policy's redaction applies on top of the task's; either can omit everything.
-        let logged = task
-            .policy
-            .policy
-            .arguments_for_log(tool, args)
-            .and_then(|logged| match &session.policy {
-                Some(own) => own.policy.arguments_for_log(tool, &logged),
-                None => Some(logged),
+        // Narrowing policies' redaction applies on top of the task's; any can omit everything.
+        let logged = session
+            .narrowing
+            .iter()
+            .fold(task.policy.policy.arguments_for_log(tool, args), |logged, n| {
+                logged.and_then(|logged| n.policy.policy.arguments_for_log(tool, &logged))
             });
         match &logged {
             Some(arguments) => data["arguments"] = arguments.clone(),
@@ -569,7 +750,7 @@ impl Engine {
         let source = &session.source;
         let taints = !task.facts.taint_sources.contains(source)
             && (task.policy.policy.is_untrusted(source)
-                || session.policy.as_ref().is_some_and(|p| p.policy.is_untrusted(source)));
+                || session.narrowing.iter().any(|n| n.policy.policy.is_untrusted(source)));
         if !taints {
             return Ok(());
         }
@@ -592,6 +773,11 @@ impl Engine {
         let task_id = session.task.clone();
         let mut counters = vec![&mut session.counters];
         if let Some(task) = self.tasks.get_mut(&task_id) {
+            if allowed {
+                for fork in &session.forks {
+                    *task.fork_calls.entry(fork.clone()).or_default() += 1;
+                }
+            }
             counters.push(&mut task.counters);
         }
         for c in counters {
@@ -803,7 +989,7 @@ impl Engine {
             .filter(|name| {
                 task.ended
                     || task.policy.policy.always_denies(name)
-                    || session.policy.as_ref().is_some_and(|p| p.policy.always_denies(name))
+                    || session.narrowing.iter().any(|n| n.policy.policy.always_denies(name))
             })
             .cloned()
             .collect())
@@ -874,18 +1060,22 @@ impl Engine {
 
 /// Why another allowed call would exceed a `max_tool_calls` limit, if it would.
 fn limit_reached(task: &Task, session: &Session) -> Option<String> {
-    let limits = [
-        (
-            task.policy.policy.limits.max_tool_calls,
-            task.counters.calls_allowed,
-            "task",
-        ),
-        (
-            session.policy.as_ref().and_then(|p| p.policy.limits.max_tool_calls),
-            session.counters.calls_allowed,
-            "session",
-        ),
-    ];
+    let mut limits = vec![(
+        task.policy.policy.limits.max_tool_calls,
+        task.counters.calls_allowed,
+        "task".to_string(),
+    )];
+    for n in &session.narrowing {
+        let (used, scope) = match &n.fork {
+            // A fork's limit is shared by every session opened with it.
+            Some(fork) => (
+                task.fork_calls.get(fork).copied().unwrap_or(0),
+                n.name.trim_end_matches(" policy").to_string(),
+            ),
+            None => (session.counters.calls_allowed, "session".to_string()),
+        };
+        limits.push((n.policy.policy.limits.max_tool_calls, used, scope));
+    }
     limits.iter().find_map(|(max, used, scope)| {
         max.filter(|m| used >= m)
             .map(|m| format!("{scope} max_tool_calls limit reached ({m})"))
@@ -896,12 +1086,14 @@ fn limit_reached(task: &Task, session: &Session) -> Option<String> {
 /// task's policy has no `approvals:` block. A narrowing policy may shorten it.
 fn approval_timeout(task: &Task, session: &Session) -> Option<Duration> {
     let base = task.policy.policy.approvals?.timeout;
-    let narrowed = session
-        .policy
-        .as_ref()
-        .and_then(|p| p.policy.approvals)
-        .map(|a| a.timeout);
-    Some(narrowed.map_or(base, |n| n.min(base)))
+    Some(
+        session
+            .narrowing
+            .iter()
+            .filter_map(|n| n.policy.policy.approvals)
+            .map(|a| a.timeout)
+            .fold(base, Duration::min),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -963,6 +1155,67 @@ capabilities:
 
     fn decide(engine: &mut Engine, session: &str, tool: &str, args: Value) -> Outcome {
         engine.decide(session, &json!(1), tool, &args).unwrap().outcome
+    }
+
+    #[test]
+    fn tokens_join_live_tasks_and_expire() {
+        let (mut e, _dir) = engine();
+        let task = e
+            .create_task(policy(TASK_POLICY), Authority::default(), json!({}))
+            .unwrap();
+        let token = e.task_token(&task, Duration::from_secs(1)).unwrap();
+        let s = e.open_session_with_token(&token, None, None, "srv", json!({})).unwrap();
+        assert_eq!(decide(&mut e, &s, "db.query", json!({})), Outcome::Allow);
+        // Expiry has second precision: wait out the second it falls in.
+        std::thread::sleep(Duration::from_millis(2100));
+        let late = e.decide(&s, &json!(2), "db.query", &json!({})).unwrap();
+        assert_eq!(late.outcome, Outcome::Deny);
+        assert!(late.reason.contains("expired"), "{}", late.reason);
+        assert!(
+            e.open_session_with_token(&token, None, None, "srv2", json!({}))
+                .is_err()
+        );
+
+        // A fresh token for an ended task joins nothing.
+        let token = e.task_token(&task, Duration::from_secs(60)).unwrap();
+        e.end_task(&task, "done").unwrap();
+        let err = e
+            .open_session_with_token(&token, None, None, "srv3", json!({}))
+            .unwrap_err();
+        assert!(err.to_string().contains("ended"), "{err}");
+    }
+
+    #[test]
+    fn forks_are_held_to_max_depth() {
+        let (mut e, _dir) = engine();
+        let task = e
+            .create_task(
+                policy(&TASK_POLICY.replace("max_tool_calls: 3", "max_tool_calls: 3\n  max_depth: 1")),
+                Authority::default(),
+                json!({}),
+            )
+            .unwrap();
+        let root = e.task_token(&task, Duration::from_secs(60)).unwrap();
+        let narrow = format!("{SESSION_POLICY}limits:\n  max_depth: 0\n");
+        let child = token::fork(
+            &root,
+            &token::ForkSpec {
+                policy: Some(&narrow),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let grandchild = token::fork(&child, &token::ForkSpec::default()).unwrap();
+        assert!(e.open_session_with_token(&root, None, None, "a", json!({})).is_ok());
+        // The fork's own max_depth 0 is below its depth: it forbade being forked into.
+        let err = e
+            .open_session_with_token(&child, None, None, "b", json!({}))
+            .unwrap_err();
+        assert!(err.to_string().contains("max_depth 0"), "{err}");
+        let err = e
+            .open_session_with_token(&grandchild, None, None, "c", json!({}))
+            .unwrap_err();
+        assert!(err.to_string().contains("forked 2 deep"), "{err}");
     }
 
     #[test]

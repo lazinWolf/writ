@@ -180,7 +180,8 @@ fn poisoned_ticket_without_approvals() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
         cmd.env("WRIT_SOCKET", path("run/writd.sock"))
             .env("WRIT_LOG", path("flight.jsonl"))
-            .env_remove("WRIT_TASK");
+            .env_remove("WRIT_TASK")
+            .env_remove("WRIT_TOKEN");
         cmd
     };
 
@@ -268,7 +269,8 @@ fn poisoned_ticket_demo() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
         cmd.env("WRIT_SOCKET", path("run/writd.sock"))
             .env("WRIT_LOG", path("flight.jsonl"))
-            .env_remove("WRIT_TASK");
+            .env_remove("WRIT_TASK")
+            .env_remove("WRIT_TOKEN");
         cmd
     };
 

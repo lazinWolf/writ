@@ -96,21 +96,21 @@ impl Backend for LocalBackend {
     }
 }
 
-/// writd: join `task` (optionally narrowed by `policy`), or, without a task,
-/// an implicit task from `policy` that `writ ps` can see.
+/// writd: join the task `token` grants (optionally narrowed by `policy`),
+/// or, without a token, an implicit task from `policy` that `writ ps` can see.
 pub struct DaemonBackend {
     client: Client,
-    task: Option<String>,
+    token: Option<String>,
     policy: Option<String>,
     entitlements: Option<String>,
 }
 
 impl DaemonBackend {
     /// `entitlements` is the text of `policy`'s entitlement source, if it declares one.
-    pub fn new(client: Client, task: Option<String>, policy: Option<String>, entitlements: Option<String>) -> Self {
+    pub fn new(client: Client, token: Option<String>, policy: Option<String>, entitlements: Option<String>) -> Self {
         DaemonBackend {
             client,
-            task,
+            token,
             policy,
             entitlements,
         }
@@ -120,7 +120,7 @@ impl DaemonBackend {
 impl Backend for DaemonBackend {
     fn open(&mut self, name: &str, info: Value) -> Result<String> {
         self.client.open_session(
-            self.task.as_deref(),
+            self.token.as_deref(),
             self.policy.as_deref(),
             self.entitlements.as_deref(),
             name,

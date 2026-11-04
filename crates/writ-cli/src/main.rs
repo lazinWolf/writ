@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use writ_daemon::{Client, LoadedEntitlements, LoadedPolicy, SOCKET_ENV, TASK_ENV};
+use writ_daemon::{Client, LEGACY_TASK_ENV, LoadedEntitlements, LoadedPolicy, SOCKET_ENV, TASK_ID_ENV, TOKEN_ENV};
 use writ_policy::Policy;
 use writ_proxy::{Backend, DaemonBackend, LocalBackend};
 use writ_recorder::{Entry, Recorder};
@@ -21,11 +21,12 @@ struct Cli {
 enum Commands {
     /// Run an MCP server over stdio with every tools/call checked against a policy.
     ///
-    /// Under `writ run` (WRIT_TASK set) the server joins that task through writd: the task's
+    /// Under `writ run` (WRIT_TOKEN set) the server joins that task through writd: the task's
     /// policy and limits apply, and --policy can only narrow them. Otherwise --policy is
     /// required and decisions are made in this process, or in writd with --daemon.
+    /// The server never sees the token: it is removed from the server's environment.
     Wrap {
-        /// Path to writ.yaml. Required unless WRIT_TASK is set.
+        /// Path to writ.yaml. Required unless WRIT_TOKEN is set.
         #[arg(long)]
         policy: Option<PathBuf>,
         /// The server's name. Its session is `mcp:<name>`, which is what policies match in
@@ -58,11 +59,37 @@ enum Commands {
         /// the policy's entitlement source. Unverified: writ records it as asserted.
         #[arg(long)]
         principal: Option<String>,
+        /// How long the task's token (WRIT_TOKEN) is valid. Sessions opened with it are
+        /// denied once it expires.
+        #[arg(long, default_value = "24h", value_parser = humantime::parse_duration)]
+        ttl: Duration,
         /// Flight recorder file, used if this command starts writd.
         #[arg(long)]
         log: Option<PathBuf>,
         /// The agent command and its arguments.
         #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Narrow this task's token for a sub-agent, without asking writd.
+    ///
+    /// Reads WRIT_TOKEN and appends a signed block: a narrowing policy, a label for the
+    /// lineage, a shorter expiry. Servers the sub-agent wraps get the task's policy and
+    /// every fork's, most restrictive outcome wins. A fork can only narrow; nothing in it
+    /// can widen what the token grants. With a command, runs it with the forked token;
+    /// without, prints the token.
+    Fork {
+        /// A policy the sub-agent is held to, on top of the task's. It can't declare an
+        /// entitlement source (the task's applies).
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Names this branch in decisions and the log, e.g. `billing`.
+        #[arg(long)]
+        label: Option<String>,
+        /// Expire the forked token sooner than its parent.
+        #[arg(long, value_parser = humantime::parse_duration)]
+        ttl: Option<Duration>,
+        /// The sub-agent command and its arguments.
+        #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
     /// List live tasks.
@@ -162,7 +189,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     name
                 }
             };
-            let backend = wrap_backend(policy.as_deref(), daemon, log, !no_fsync)?;
+            let (backend, token) = wrap_backend(policy.as_deref(), daemon, log, !no_fsync)?;
             let config = writ_proxy::WrapConfig {
                 backend,
                 name,
@@ -170,6 +197,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 command,
                 shutdown_grace,
                 forward_signals: true,
+                token,
             };
             let code = writ_proxy::run(config, std::io::stdin(), std::io::stdout())?;
             Ok(exit_code(code))
@@ -177,9 +205,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Run {
             policy,
             principal,
+            ttl,
             log,
             command,
-        } => run_task(&policy, principal.as_deref(), log.as_deref(), &command),
+        } => run_task(&policy, principal.as_deref(), ttl, log.as_deref(), &command),
+        Commands::Fork {
+            policy,
+            label,
+            ttl,
+            command,
+        } => fork(policy.as_deref(), label.as_deref(), ttl, &command),
         Commands::Ps => ps(),
         Commands::Sudo { action } => sudo(action),
         Commands::Replay {
@@ -201,6 +236,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .max_tool_calls
                     .map_or("unlimited".to_string(), |n| n.to_string()),
             );
+            if let Some(depth) = parsed.limits.max_depth {
+                println!("  max_depth: {depth} (forks below the root)");
+            }
             if !parsed.untrusted_sources.is_empty() {
                 println!("  untrusted sources: {}", parsed.untrusted_sources.join(", "));
             }
@@ -282,33 +320,44 @@ fn read_policy(path: &Path) -> Result<PolicyFiles> {
     })
 }
 
-fn wrap_backend(policy: Option<&Path>, daemon: bool, log: Option<PathBuf>, fsync: bool) -> Result<Box<dyn Backend>> {
-    let task = std::env::var(TASK_ENV).ok().filter(|t| !t.is_empty());
+/// The backend to decide through, and the token it joined a task with (if any).
+fn wrap_backend(
+    policy: Option<&Path>,
+    daemon: bool,
+    log: Option<PathBuf>,
+    fsync: bool,
+) -> Result<(Box<dyn Backend>, Option<String>)> {
+    let non_empty = |key| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let token = non_empty(TOKEN_ENV);
+    if token.is_none() && non_empty(LEGACY_TASK_ENV).is_some() {
+        // Running outside the task would be silently looser than the caller expects.
+        bail!(
+            "{LEGACY_TASK_ENV} is set, but bare task ids no longer join a task: \
+             run the agent under `writ run`, which sets {TOKEN_ENV}"
+        );
+    }
     let policy = policy.map(read_policy).transpose()?;
     let socket = writ_daemon::default_socket_path();
 
-    if let Some(task) = task {
+    if let Some(token) = token {
         // Fail closed: the task's limits can only be enforced by writd.
         let client = Client::connect(&socket)
-            .with_context(|| format!("{TASK_ENV} is set but writd is unreachable; refusing to run the server"))?;
+            .with_context(|| format!("{TOKEN_ENV} is set but writd is unreachable; refusing to run the server"))?;
         // A narrowing policy reads the task's entitlement source; writd rejects one that declares its own.
         let (policy, entitlements) = match policy {
             Some(files) => (Some(files.policy), files.entitlements),
             None => (None, None),
         };
-        return Ok(Box::new(DaemonBackend::new(client, Some(task), policy, entitlements)));
+        let backend = DaemonBackend::new(client, Some(token.clone()), policy, entitlements);
+        return Ok((Box::new(backend), Some(token)));
     }
     let Some(files) = policy else {
         bail!("--policy is required unless running under `writ run`");
     };
     if daemon {
         let client = Client::connect_or_start(&socket, log.as_deref())?;
-        return Ok(Box::new(DaemonBackend::new(
-            client,
-            None,
-            Some(files.policy),
-            files.entitlements,
-        )));
+        let backend = DaemonBackend::new(client, None, Some(files.policy), files.entitlements);
+        return Ok((Box::new(backend), None));
     }
     let mut recorder = Recorder::open(log.unwrap_or_else(writ_recorder::default_log_path))?;
     recorder.set_fsync(fsync);
@@ -317,14 +366,56 @@ fn wrap_backend(policy: Option<&Path>, daemon: bool, log: Option<PathBuf>, fsync
         .as_deref()
         .map(LoadedEntitlements::parse)
         .transpose()?;
-    Ok(Box::new(LocalBackend::new(
-        recorder,
-        LoadedPolicy::parse(&files.policy)?,
-        entitlements,
-    )))
+    let backend = LocalBackend::new(recorder, LoadedPolicy::parse(&files.policy)?, entitlements);
+    Ok((Box::new(backend), None))
 }
 
-fn run_task(policy: &Path, principal: Option<&str>, log: Option<&Path>, command: &[String]) -> Result<ExitCode> {
+fn fork(policy: Option<&Path>, label: Option<&str>, ttl: Option<Duration>, command: &[String]) -> Result<ExitCode> {
+    let token = std::env::var(TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .with_context(|| {
+            format!("{TOKEN_ENV} is not set: `writ fork` narrows a task's token, so run it under `writ run`")
+        })?;
+    let policy = policy
+        .map(|path| -> Result<String> {
+            let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+            let loaded = LoadedPolicy::parse(&text).with_context(|| format!("{}", path.display()))?;
+            if loaded.policy.entitlements.is_some() {
+                bail!(
+                    "{}: a fork's policy can't declare an entitlement source; the task's applies",
+                    path.display()
+                );
+            }
+            Ok(text)
+        })
+        .transpose()?;
+    if let Some(label) = label {
+        writ_policy::validate_session_name(label).map_err(|e| anyhow::anyhow!("--label: {e}"))?;
+    }
+    let spec = writ_daemon::token::ForkSpec {
+        label,
+        policy: policy.as_deref(),
+        ttl,
+    };
+    let forked = writ_daemon::token::fork(&token, &spec)?;
+    let Some((program, args)) = command.split_first() else {
+        println!("{forked}");
+        return Ok(ExitCode::SUCCESS);
+    };
+    // Replace this process: the sub-agent gets our signals and our exit status.
+    use std::os::unix::process::CommandExt;
+    let err = Command::new(program).args(args).env(TOKEN_ENV, &forked).exec();
+    Err(anyhow::Error::new(err).context(format!("failed to start `{program}`")))
+}
+
+fn run_task(
+    policy: &Path,
+    principal: Option<&str>,
+    ttl: Duration,
+    log: Option<&Path>,
+    command: &[String],
+) -> Result<ExitCode> {
     let files = read_policy(policy)?;
     let socket = writ_daemon::default_socket_path();
     // The connection stays open while the agent runs: if writ run dies, writd ends the task.
@@ -334,12 +425,15 @@ fn run_task(policy: &Path, principal: Option<&str>, log: Option<&Path>, command:
         "user": std::env::var("USER").ok(),
         "cwd": std::env::current_dir().ok(),
     });
-    let task = client.create_task(&files.policy, files.entitlements.as_deref(), principal, meta)?;
+    let created = client.create_task(&files.policy, files.entitlements.as_deref(), principal, Some(ttl), meta)?;
+    let task = created.task;
 
     let (program, args) = command.split_first().context("no command given")?;
     let mut child = Command::new(program)
         .args(args)
-        .env(TASK_ENV, &task)
+        .env(TOKEN_ENV, &created.token)
+        .env(TASK_ID_ENV, &task)
+        .env_remove(LEGACY_TASK_ENV)
         .env(SOCKET_ENV, &socket)
         .spawn()
         .with_context(|| format!("failed to start `{program}`"))?;
@@ -542,10 +636,10 @@ fn sudo(action: SudoAction) -> Result<ExitCode> {
         }
         SudoAction::Approve { id } | SudoAction::Deny { id } => {
             let approve = matches!(action_kind, Kind::Approve);
-            if std::env::var_os(TASK_ENV).is_some() {
+            if std::env::var_os(TOKEN_ENV).is_some() || std::env::var_os(TASK_ID_ENV).is_some() {
                 // A guard, not a boundary: same-user processes can reach writd directly.
                 bail!(
-                    "refusing to decide approval `{id}` from inside a writ task ({TASK_ENV} is set): \
+                    "refusing to decide approval `{id}` from inside a writ task ({TOKEN_ENV} is set): \
                      an agent must not approve its own calls. Run `writ sudo` from your own shell."
                 );
             }
@@ -693,12 +787,28 @@ fn format_entry(entry: &Entry) -> String {
             s(&d["namespace"]),
             s(&d["policy_sha256"]),
         ),
-        "session_start" => format!(
-            "{} {} (task {})",
-            s(&d["source"]),
-            command(&d["info"]["command"]),
-            s(&d["task"])
-        ),
+        "session_start" => {
+            let forks: Vec<&str> = d["writ"]["forks"]
+                .as_array()
+                .map(|f| {
+                    f.iter()
+                        .map(|f| f["label"].as_str().unwrap_or("(unlabelled)"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let lineage = if forks.is_empty() {
+                String::new()
+            } else {
+                format!(", fork {}", forks.join(" > "))
+            };
+            format!(
+                "{} {} (task {}{lineage})",
+                s(&d["source"]),
+                command(&d["info"]["command"]),
+                s(&d["task"])
+            )
+        }
+        "token_issued" => format!("token {} for task {}", s(&d["token"]), s(&d["task"])),
         "taint" => format!(
             "task {} tainted: {} read from {}",
             s(&d["task"]),

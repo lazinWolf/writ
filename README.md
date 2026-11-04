@@ -2,7 +2,7 @@
 
 Policy and lineage layer for agent tool calls. See `plan-v2.md` for the full plan and `OBSERVATIONS.md` for where things stand.
 
-This is cooperative-mode work: `writ wrap` (a stdio MCP proxy), `writd` (the local daemon that owns tasks and decisions), `writ run` (start an agent as a task), `writ ps`, and `writ sudo` (decide calls waiting for a human). The poisoned-ticket demo in `examples/poisoned-ticket` runs end to end.
+This is cooperative-mode work: `writ wrap` (a stdio MCP proxy), `writd` (the local daemon that owns tasks and decisions), `writ run` (start an agent as a task), `writ fork` (narrow a task for a sub-agent), `writ ps`, `writ sudo` (decide calls waiting for a human), and `writ replay`. The poisoned-ticket demo in `examples/poisoned-ticket` runs end to end.
 
 ## Tasks: authority belongs to the task, not the server
 
@@ -10,12 +10,12 @@ This is cooperative-mode work: `writ wrap` (a stdio MCP proxy), `writd` (the loc
 writ run --policy writ.yaml -- my-agent --flags
 ```
 
-`writ run` asks writd (starting it if needed) to create a **task** from the policy. It then runs the agent with `WRIT_TASK` set. Every `writ wrap` the agent starts, one per MCP server, inherits that variable and joins the task:
+`writ run` asks writd (starting it if needed) to create a **task** from the policy. writd answers with a signed **token** for it, and `writ run` runs the agent with the token in `WRIT_TOKEN` (and the task's id, for display only, in `WRIT_TASK_ID`). Every `writ wrap` the agent starts, one per MCP server, inherits the token, and joins the task by presenting it:
 
 - **One policy, shared limits.** `max_tool_calls` counts calls across all of the agent's servers, not per server.
 - **Narrowing only.** A `writ wrap --policy narrow.yaml` inside a task adds its own policy, and both are evaluated with the most restrictive outcome winning. A wrapped server can lose authority the task grants. It can never gain authority the task doesn't grant.
 - **Revocation.** When `writ run` exits, or dies, writd ends the task, and every later call in its sessions is denied.
-- **Fails closed.** If `WRIT_TASK` is set but writd is unreachable, or the task is unknown, `writ wrap` refuses to start the server. If writd goes away mid-session, every call is denied.
+- **Fails closed.** If `WRIT_TOKEN` is set but writd is unreachable, or the token is invalid, expired, or for a task that has ended, `writ wrap` refuses to start the server. If writd goes away mid-session, every call is denied. A leftover `WRIT_TASK` (the unsigned id earlier builds used) is refused, not ignored.
 
 `writ ps` lists live tasks:
 
@@ -24,13 +24,28 @@ TASK                          USER        NAMESPACE           SESSIONS        CA
 tsk_18e45a…                   dividh      prod-customer-ops          2       41/200       3  YES           12m  mcp:zendesk,mcp:stripe    my-agent --flags
 ```
 
-**Not yet a security boundary between processes.** `WRIT_TASK` is an unsigned ID: any process running as the same user can claim any task. Cooperative mode already trusts the agent framework to route calls through writ (plan-v2.md §5.2). Signed, attenuating writ tokens replace this ID next.
+### Tokens and `writ fork`
+
+The token is a [Biscuit](https://www.biscuitsec.org). writd signs it with a key that exists only in writd's memory, so nothing else can mint one, and a writd restart (which ends every task anyway) invalidates every token. It names the task, its namespace, the hash of its policy, the root principal, and an expiry (`writ run --ttl`, 24h by default; a session whose token expires is denied from then on). Task ids, which `writ ps` and the log show, carry no authority: writd refuses to join a task by id.
+
+A holder can narrow a token without asking writd, and nobody can widen one:
+
+```sh
+writ fork --policy billing.yaml --label billing --ttl 10m -- billing-agent   # runs it with the forked token
+writ fork --label audit                                                      # prints the forked token
+```
+
+Each fork appends a signed block with an optional narrowing policy, a label, and an earlier expiry. Blocks can be added but never removed or edited, and writd only uses them to restrict. Every server the sub-agent wraps is decided by the task's policy and every fork's policy, and the most restrictive outcome wins. A fork's `max_tool_calls` counts calls across all servers opened with that fork, and `limits.max_depth` (in the task's policy or a fork's) caps how deep forks can go. The log records each session's lineage (`writ log` shows `fork billing > audit`) and the token's fingerprint, never the token itself.
+
+**The wrapped server never sees the token.** `writ wrap` removes `WRIT_TOKEN` from the server's environment, strips `_meta` keys under `writ/`, and refuses to forward any message that contains its token (so an agent tricked into pasting it into a tool call can't hand it over).
+
+**What this is and isn't, in cooperative mode.** Holding a task's token is what grants its authority, and a sub-agent given a forked token can't recover its parent's. But a process running as the same user can read another's environment (`/proc/<pid>/environ`) and talk to writd directly, so this isn't a boundary against same-user code. That needs mediated mode (plan-v2.md §5.2). Cooperative mode already trusts the agent framework to route calls through writ, and in-process sub-agents share memory, so `writ fork` there is a strong convention rather than a wall (plan-v2.md §4.1). Roots are still asserted, not verified (`--principal`). The token design hasn't had an outside security review yet.
 
 ## Modes of `writ wrap`
 
 | Invocation | Decisions made by | Policy |
 |---|---|---|
-| under `writ run` (`WRIT_TASK` set) | writd | the task's, narrowed by `--policy` if given |
+| under `writ run` (`WRIT_TOKEN` set) | writd | the task's, narrowed by every fork's and by `--policy` if given |
 | `writ wrap --daemon --policy p.yaml` | writd (started if needed) | `p.yaml`, as its own task; visible in `writ ps` |
 | `writ wrap --policy p.yaml` | this process | `p.yaml`, as its own task |
 
@@ -42,7 +57,7 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 - **Server names:** `writ wrap --name zendesk` makes the session `mcp:zendesk`, the name policies match in `data_flow.untrusted_sources` and see as `writ.session.name`. Without `--name`, writ derives one from the command (`npx -y @scope/server-postgres` → `mcp:server-postgres`) and warns. Name servers explicitly whenever a policy refers to them.
 - **Taint (coarse, per task):** list servers whose content may be attacker-written in `data_flow.untrusted_sources: ["mcp:zendesk"]`. The first **allowed** call to one of them taints the whole task, across all its servers, before the call is forwarded. Denied calls don't taint, and taint is never cleared. On a tainted task, a tool whose rule says `privileged: true` gets `data_flow.on_taint.privileged_mutations` (`require_sudo` by default, or `deny`); other tools are unaffected. The flight log records a `taint` event, every decision records the facts it saw, and `writ ps` shows a TAINTED column. Either the task's policy or a narrowing policy can declare a source untrusted.
 - **Entitlements (who the task acts for):** `writ run --principal alice@example.com` gives the task a root principal, recorded as **unverified** (it's asserted by whoever runs the command, until roots are minted from an identity proof). The policy names an entitlement source, `entitlements: {source: file, path: entitlements.yaml}` (a mock; the path is relative to the policy). Its `principals.<id>` become `writ.root.*`. A rule can `lookup:` a record, such as `charge: {table: charges, key: args.charge}`, and state `entitlements:`, such as `charge.customer in writ.root.entitled_customers` and `args.amount <= charge.amount`. A call that breaks one gets `on_entitlement_violation` (`deny` by default), whatever else applies. A call whose entitlements all hold is **covered**: it's within the root's own authority, so taint doesn't add an approval requirement. Unknown principals, unknown records and a missing source all fail closed. Both files are read once when the task starts, and their hashes are recorded. A narrowing policy can't bring its own source.
-- **`limits.max_tool_calls`**, per task, and also per session when a narrowing policy sets it.
+- **`limits.max_tool_calls`**, per task, per fork when a fork's policy sets it, and per session when a `writ wrap --policy` sets it. **`limits.max_depth`** caps how many times a task's token can be forked.
 - **Approvals (`require_sudo`):** with an `approvals:` block in the task's policy (`approvals: {timeout: 15m}`; 15m is the default), a call that needs a human **pauses**. The agent gets no placeholder: its call simply hasn't returned yet, and other calls, on that server and others, keep flowing. writ prints the approval id on stderr. A human decides from their own shell:
 
   ```sh
@@ -54,18 +69,18 @@ All three run the same engine (`writ-daemon`) and write the same log format.
 
   An approved call is re-checked first: if its task ended or a `max_tool_calls` limit was reached while it waited, it's still refused. No decision before the timeout means denial. Ending the task or closing the server also denies its waiting calls, and so does stopping writd (recorded as `cancelled` before it exits; if writd is killed outright, a `tool_call` with an approval id and no `approval` entry means the call was never forwarded). Each settlement (`approve`, `deny`, `timeout`, `cancelled`) is recorded durably as an `approval` event with the approver (`$USER`, plus the pid and uid writd sees), and an approved call is forwarded only after that. A narrowing policy can shorten the timeout. Without an `approvals:` block, or in a standalone `writ wrap` (there's no writd to ask), `require_sudo` calls are refused with an explanation, as before.
 
-  **Approvals are guarded, but not yet a boundary against the agent itself.** Two checks stop an agent from approving its own calls. `writ sudo` refuses to run inside a writ task (`WRIT_TASK` set). And on Linux, writd refuses an approve or deny that comes from a descendant of the task's `writ run` (the agent and anything it starts) or of one of its `writ wrap`s (a wrapped MCP server), so hiding `WRIT_TASK` doesn't help. A same-user process that has detached from its parent (double-forked, reparented to init) escapes the second check, and neither applies to a standalone `writ wrap --daemon`, whose agent isn't writd's to know. Signed approvals (passkeys) are planned.
+  **Approvals are guarded, but not yet a boundary against the agent itself.** Two checks stop an agent from approving its own calls. `writ sudo` refuses to run inside a writ task (`WRIT_TOKEN` set). And on Linux, writd refuses an approve or deny that comes from a descendant of the task's `writ run` (the agent and anything it starts) or of one of its `writ wrap`s (a wrapped MCP server), so hiding `WRIT_TOKEN` doesn't help. A same-user process that has detached from its parent (double-forked, reparented to init) escapes the second check, and neither applies to a standalone `writ wrap --daemon`, whose agent isn't writd's to know. Signed approvals (passkeys) are planned.
 - **Flight recorder:** every decision is written to a hash-chained JSONL log before the call is forwarded, and an **allowed** decision reaches stable storage (fdatasync) first. Denials are written but not synced individually, so a flood of denied calls can't force a sync per call; the next sync persists them. If a decision can't be recorded, the call is denied. Use `--no-fsync` (on `writ wrap` or `writd`) to trade crash durability for latency.
 - **Redaction:** per rule, `redact: ["args.card", "args.headers.*"]` replaces values with `[redacted]` in the log, and `record_arguments: false` omits arguments entirely. When several rules apply, including a narrowing policy, their settings combine and the most protective wins. Decision reasons never echo a redacted value.
 - **`tools/list` filtering:** tools the policies always deny are hidden. This is a usability aid; enforcement happens on every `tools/call`.
 - **Server-initiated requests** (sampling, elicitation) are recorded by method only, and are not yet governed by policy.
 - **Shutdown:** the server runs in its own process group. If it outlives the client by more than `--shutdown-grace` (default 5s), writ sends SIGTERM to the group, then SIGKILL. That covers `npx` → `node` style launcher chains. Signals sent to writ are forwarded to the server.
 
-Any writ.yaml field from the spec that this build doesn't enforce (`approvals`, `data_flow.declassify`, `preconditions`, `max_depth`, `max_budget_usd`, …) is **rejected at load time**, so a policy never appears to grant a guarantee it doesn't have.
+Any writ.yaml field from the spec that this build doesn't enforce (`data_flow.declassify`, `preconditions`, `max_parallel_agents`, `max_budget_usd`, …) is **rejected at load time**, so a policy never appears to grant a guarantee it doesn't have.
 
 ## Not yet
 
-Signed writ tokens and lineage across hops, verified root principals, a real entitlement source (Stripe, CRM, IdP), approvals over Slack and signed approver identities, precondition revalidation for approved calls, finer-grained taint (per branch, per value), and external anchoring of the log. In cooperative mode, an agent with a shell or raw network access can bypass writ (plan-v2.md §5.2).
+Tokens across machines (MCP `_meta`, A2A headers) and at system edges (RFC 8693), verified root principals, a real entitlement source (Stripe, CRM, IdP), approvals over Slack and signed approver identities, precondition revalidation for approved calls, finer-grained taint (per branch, per value), and external anchoring of the log. In cooperative mode, an agent with a shell or raw network access can bypass writ (plan-v2.md §5.2).
 
 ## Usage
 

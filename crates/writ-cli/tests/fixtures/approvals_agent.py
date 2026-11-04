@@ -3,7 +3,7 @@
 1. Sends a refund that needs approval (id 1), then a query (id 2) right
    after, on the same wrapped server, and records the order the answers
    arrive in: the query must not wait behind the paused refund.
-2. Tries `writ sudo approve` on its own paused call (it has WRIT_TASK set).
+2. Tries `writ sudo approve` on its own paused call (it has WRIT_TOKEN set).
 3. Waits for the refund's answer (the test approves it from outside).
 4. Sends a second refund (id 3) that nobody decides, so it times out.
 
@@ -42,7 +42,8 @@ def sudo(*args, env=None):
 
 def without_task_env():
     env = dict(os.environ)
-    env.pop("WRIT_TASK", None)
+    for key in ("WRIT_TOKEN", "WRIT_TASK_ID", "WRIT_TASK"):
+        env.pop(key, None)
     return env
 
 
@@ -59,7 +60,7 @@ while not pending and time.time() < deadline:
     pending = json.loads(listed["stdout"]) if listed["code"] == 0 else []
     time.sleep(0.05)
 self_approve = sudo("approve", pending[0]["id"]) if pending else {"code": None}
-# Hiding WRIT_TASK gets past the CLI's check; writd must still refuse, since we
+# Hiding WRIT_TOKEN gets past the CLI's check; writd must still refuse, since we
 # descend from the task's `writ run`.
 self_approve_unset = sudo("approve", pending[0]["id"], env=without_task_env()) if pending else {"code": None}
 

@@ -57,7 +57,19 @@ pub struct WrapConfig {
     /// Forward SIGTERM, SIGINT, and SIGHUP received by this process to the
     /// server. Installs process-wide signal handlers.
     pub forward_signals: bool,
+    /// The writ token this proxy joined its task with. The server must never
+    /// see it: it isn't passed in the server's environment, and a message
+    /// containing it is refused rather than forwarded.
+    pub token: Option<String>,
 }
+
+/// Environment variables holding writ material, removed from the server's
+/// environment: a server that read the token could replay it.
+const WRIT_ENV: &[&str] = &[writ_daemon::TOKEN_ENV, writ_daemon::LEGACY_TASK_ENV];
+
+/// `_meta` keys under this prefix are writ's (plan-v2.md §4.1 carries writs
+/// in `_meta`). They are removed before a message reaches the server.
+const WRIT_META_PREFIX: &str = "writ/";
 
 struct PendingCall {
     tool: String,
@@ -106,7 +118,11 @@ where
     W: Write + Send + 'static,
 {
     let (program, args) = config.command.split_first().context("no server command given")?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    for key in WRIT_ENV {
+        command.env_remove(key);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -142,8 +158,9 @@ where
     }
     {
         let (state, client_out, events) = (state.clone(), client_out.clone(), events.clone());
+        let token = config.token.clone();
         thread::spawn(move || {
-            client_to_server(client_in, server_in, &state, &client_out);
+            client_to_server(client_in, server_in, &state, &client_out, token.as_deref());
             let _ = events.send(Event::ClientClosed);
         });
     }
@@ -214,6 +231,7 @@ fn client_to_server<R: Read, W: Write + Send + 'static>(
     server_in: ServerIn,
     state: &Shared<State>,
     client_out: &Shared<W>,
+    token: Option<&str>,
 ) {
     for line in BufReader::new(client_in).lines() {
         let Ok(line) = line else { break };
@@ -245,7 +263,29 @@ fn client_to_server<R: Read, W: Write + Send + 'static>(
                 }
                 None
             }
-            Ok(message) => handle_client_message(message, state, client_out, &server_in),
+            Ok(message) if token.is_some_and(|t| mentions(&message, t)) => {
+                // The agent (or an injection steering it) put the task's token in a
+                // message. Forwarding it would hand the server this task's authority.
+                state.lock().unwrap().record_or_warn(
+                    "protocol_error",
+                    json!({ "error": "message carried the writ token; refused", "method": message.get("method") }),
+                );
+                if let Some(id) = message.get("id") {
+                    let _ = send(
+                        client_out,
+                        &rpc_error(
+                            id,
+                            -32600,
+                            "writ: refusing to forward a message that contains the writ token",
+                        ),
+                    );
+                }
+                None
+            }
+            Ok(mut message) => {
+                strip_writ_meta(&mut message);
+                handle_client_message(message, state, client_out, &server_in)
+            }
         };
         if let Some(message) = outgoing
             && !forward(&server_in, &message)
@@ -256,6 +296,23 @@ fn client_to_server<R: Read, W: Write + Send + 'static>(
     // Dropping the server's stdin closes it: the MCP stdio shutdown signal. Calls
     // still waiting for approval then have nowhere to go, and are dropped.
     server_in.lock().unwrap().take();
+}
+
+/// True if any string in `value` (keys included) contains `token`.
+fn mentions(value: &Value, token: &str) -> bool {
+    match value {
+        Value::String(s) => s.contains(token),
+        Value::Array(items) => items.iter().any(|v| mentions(v, token)),
+        Value::Object(map) => map.iter().any(|(k, v)| k.contains(token) || mentions(v, token)),
+        _ => false,
+    }
+}
+
+/// Removes writ's `_meta` keys from a request's params.
+fn strip_writ_meta(message: &mut Value) {
+    if let Some(Value::Object(meta)) = message.get_mut("params").and_then(|p| p.get_mut("_meta")) {
+        meta.retain(|key, _| !key.starts_with(WRIT_META_PREFIX));
+    }
 }
 
 /// Returns the message to forward to the server, or `None` if the proxy
