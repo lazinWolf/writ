@@ -72,9 +72,11 @@ fn is_path_char(c: char) -> bool {
 }
 
 /// Parses a path at the start of `s`. Returns it and the rest of `s`, or
-/// `None` if `s` doesn't start with `args.` or `writ.`.
-fn parse_path(s: &str) -> Option<Result<(Vec<String>, &str), String>> {
-    if !(s.starts_with("args.") || s.starts_with("writ.")) {
+/// `None` if `s` doesn't start with `args.`, `writ.`, or `<binding>.` for
+/// one of `bindings` (the names a rule's `lookup:` binds).
+fn parse_path<'s>(s: &'s str, bindings: &[String]) -> Option<Result<(Vec<String>, &'s str), String>> {
+    let rooted = |root: &str| s.strip_prefix(root).is_some_and(|rest| rest.starts_with('.'));
+    if !(rooted("args") || rooted("writ") || bindings.iter().any(|b| rooted(b))) {
         return None;
     }
     let end = s.find(|c: char| !is_path_char(c)).unwrap_or(s.len());
@@ -96,11 +98,30 @@ fn parse_path(s: &str) -> Option<Result<(Vec<String>, &str), String>> {
     Some(Ok((path, &s[end..])))
 }
 
+/// Parses `s` as exactly one `args.` or `writ.` path (a lookup's `key`).
+pub(crate) fn parse_key_path(s: &str) -> Result<Vec<String>, String> {
+    let s = s.trim();
+    let (path, rest) = parse_path(s, &[]).ok_or_else(|| format!("`{s}` is not an `args.` or `writ.` path"))??;
+    if !rest.is_empty() {
+        return Err(format!("unexpected `{rest}` after the path `{s}`"));
+    }
+    Ok(path)
+}
+
 impl Condition {
+    /// Parses a condition that may read `args.*` and `writ.*`.
     pub fn parse(source: &str) -> Result<Self, String> {
+        Self::parse_with(source, &[])
+    }
+
+    /// Parses a condition that may also read the names in `bindings`.
+    pub fn parse_with(source: &str, bindings: &[String]) -> Result<Self, String> {
         let s = source.trim();
-        let (lhs, rest) =
-            parse_path(s).ok_or_else(|| "a condition must start with an `args.` or `writ.` path".to_string())??;
+        let (lhs, rest) = parse_path(s, bindings).ok_or_else(|| {
+            let mut roots = vec!["`args.`".to_string(), "`writ.`".to_string()];
+            roots.extend(bindings.iter().map(|b| format!("`{b}.`")));
+            format!("a condition must start with a path ({})", roots.join(", "))
+        })??;
 
         let rest = rest.trim_start();
         let symbols = [
@@ -122,7 +143,7 @@ impl Condition {
             .ok_or_else(|| "expected one of <, <=, >, >=, ==, !=, in after the path".to_string())?;
 
         let rest = rest.trim();
-        let rhs = match parse_path(rest) {
+        let rhs = match parse_path(rest, bindings) {
             Some(parsed) => {
                 let (path, trailing) = parsed?;
                 if !trailing.trim().is_empty() {
@@ -332,6 +353,30 @@ mod tests {
         assert!(check("args.cur in [\"usd\", \"eur\"]", json!({"cur": "eur"})).is_ok());
         assert!(check("args.n in [1, 2]", json!({"n": 2.0})).is_ok());
         assert!(check("args.cur in [\"usd\"]", json!({"cur": "gbp"})).is_err());
+    }
+
+    #[test]
+    fn bound_names() {
+        let bindings = ["charge".to_string()];
+        let c = Condition::parse_with("charge.customer in writ.root.entitled_customers", &bindings).unwrap();
+        let args = json!({});
+        let mut facts = alice();
+        facts.tainted = true;
+        let ctx = DecisionContext::new("t", &args, &facts);
+        let mut scope = Scope::new(&ctx);
+        // Unbound (the lookup found nothing): fail closed.
+        assert!(c.check(&scope).unwrap_err().contains("charge.customer is missing"));
+        scope.bind("charge", json!({"customer": "cus_alice"}));
+        assert!(c.check(&scope).is_ok());
+        scope.bind("charge", json!({"customer": "cus_bob"}));
+        assert!(c.check(&scope).is_err());
+
+        // A name is only a root when the rule binds it, and `charges.` isn't `charge.`.
+        assert!(Condition::parse("charge.customer == 1").is_err());
+        assert!(Condition::parse_with("charges.customer == 1", &bindings).is_err());
+        assert!(parse_key_path("args.charge").is_ok());
+        assert!(parse_key_path("charge.id").is_err());
+        assert!(parse_key_path("args.charge extra").is_err());
     }
 
     #[test]

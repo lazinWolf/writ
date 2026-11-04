@@ -72,9 +72,17 @@ impl Client {
         }
     }
 
-    pub fn create_task(&mut self, policy: &str, meta: Value) -> Result<String> {
+    pub fn create_task(
+        &mut self,
+        policy: &str,
+        entitlements: Option<&str>,
+        principal: Option<&str>,
+        meta: Value,
+    ) -> Result<String> {
         let body = self.request(&Request::CreateTask {
             policy: policy.to_string(),
+            entitlements: entitlements.map(str::to_string),
+            principal: principal.map(str::to_string),
             meta,
         })?;
         string_field(&body, "task")
@@ -89,12 +97,14 @@ impl Client {
         &mut self,
         task: Option<&str>,
         policy: Option<&str>,
+        entitlements: Option<&str>,
         name: &str,
         info: Value,
     ) -> Result<String> {
         let body = self.request(&Request::OpenSession {
             task: task.map(str::to_string),
             policy: policy.map(str::to_string),
+            entitlements: entitlements.map(str::to_string),
             name: name.to_string(),
             info,
         })?;

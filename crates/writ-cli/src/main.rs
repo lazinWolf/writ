@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use writ_daemon::{Client, LoadedPolicy, SOCKET_ENV, TASK_ENV};
+use writ_daemon::{Client, LoadedEntitlements, LoadedPolicy, SOCKET_ENV, TASK_ENV};
 use writ_policy::Policy;
 use writ_proxy::{Backend, DaemonBackend, LocalBackend};
 use writ_recorder::{Entry, Recorder};
@@ -54,6 +54,10 @@ enum Commands {
         /// Path to writ.yaml for the task.
         #[arg(long)]
         policy: PathBuf,
+        /// The principal the task acts for, e.g. alice@example.com. Its entitlements come from
+        /// the policy's entitlement source. Unverified: writ records it as asserted.
+        #[arg(long)]
+        principal: Option<String>,
         /// Flight recorder file, used if this command starts writd.
         #[arg(long)]
         log: Option<PathBuf>,
@@ -131,13 +135,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let code = writ_proxy::run(config, std::io::stdin(), std::io::stdout())?;
             Ok(exit_code(code))
         }
-        Commands::Run { policy, log, command } => run_task(&policy, log.as_deref(), &command),
+        Commands::Run {
+            policy,
+            principal,
+            log,
+            command,
+        } => run_task(&policy, principal.as_deref(), log.as_deref(), &command),
         Commands::Ps => ps(),
-        Commands::Check { policy } => {
-            let parsed = Policy::from_path(&policy)?;
+        Commands::Check { policy: path } => {
+            let files = read_policy(&path)?;
+            let parsed = Policy::from_yaml_str(&files.policy)?;
             println!(
                 "{}: ok (namespace {}, enforcement {:?}, max_tool_calls {})",
-                policy.display(),
+                path.display(),
                 parsed.namespace,
                 parsed.enforcement,
                 parsed
@@ -145,6 +155,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .max_tool_calls
                     .map_or("unlimited".to_string(), |n| n.to_string()),
             );
+            if !parsed.untrusted_sources.is_empty() {
+                println!("  untrusted sources: {}", parsed.untrusted_sources.join(", "));
+            }
+            if let Some(spec) = &parsed.entitlements {
+                println!(
+                    "  entitlements: {} (tables used: {})",
+                    spec.path,
+                    match parsed.lookup_tables() {
+                        t if t.is_empty() => "none".to_string(),
+                        t => t.join(", "),
+                    }
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Log {
@@ -177,11 +200,40 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn read_policy(path: &Path) -> Result<String> {
-    // Read once: the recorded hash must describe exactly the policy being enforced.
+/// A policy's text and, if it declares one, its entitlement source's text.
+struct PolicyFiles {
+    policy: String,
+    entitlements: Option<String>,
+}
+
+/// Reads and validates a policy and its entitlement source. Each is read
+/// once: the recorded hashes must describe exactly what is enforced.
+fn read_policy(path: &Path) -> Result<PolicyFiles> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    LoadedPolicy::parse(&text).with_context(|| format!("{}", path.display()))?;
-    Ok(text)
+    let loaded = LoadedPolicy::parse(&text).with_context(|| format!("{}", path.display()))?;
+    let Some(spec) = &loaded.policy.entitlements else {
+        return Ok(PolicyFiles {
+            policy: text,
+            entitlements: None,
+        });
+    };
+    let source_path = path.parent().unwrap_or(Path::new(".")).join(&spec.path);
+    let entitlements = std::fs::read_to_string(&source_path)
+        .with_context(|| format!("cannot read the entitlement source {}", source_path.display()))?;
+    let source = LoadedEntitlements::parse(&entitlements).with_context(|| format!("{}", source_path.display()))?;
+    for table in loaded.policy.lookup_tables() {
+        if !source.source.has_table(table) {
+            bail!(
+                "{}: a rule looks up table `{table}`, which {} doesn't have",
+                path.display(),
+                source_path.display()
+            );
+        }
+    }
+    Ok(PolicyFiles {
+        policy: text,
+        entitlements: Some(entitlements),
+    })
 }
 
 fn wrap_backend(policy: Option<&Path>, daemon: bool, log: Option<PathBuf>, fsync: bool) -> Result<Box<dyn Backend>> {
@@ -193,22 +245,41 @@ fn wrap_backend(policy: Option<&Path>, daemon: bool, log: Option<PathBuf>, fsync
         // Fail closed: the task's limits can only be enforced by writd.
         let client = Client::connect(&socket)
             .with_context(|| format!("{TASK_ENV} is set but writd is unreachable; refusing to run the server"))?;
-        return Ok(Box::new(DaemonBackend::new(client, Some(task), policy)));
+        // A narrowing policy reads the task's entitlement source; writd rejects one that declares its own.
+        let (policy, entitlements) = match policy {
+            Some(files) => (Some(files.policy), files.entitlements),
+            None => (None, None),
+        };
+        return Ok(Box::new(DaemonBackend::new(client, Some(task), policy, entitlements)));
     }
-    let Some(policy) = policy else {
+    let Some(files) = policy else {
         bail!("--policy is required unless running under `writ run`");
     };
     if daemon {
         let client = Client::connect_or_start(&socket, log.as_deref())?;
-        return Ok(Box::new(DaemonBackend::new(client, None, Some(policy))));
+        return Ok(Box::new(DaemonBackend::new(
+            client,
+            None,
+            Some(files.policy),
+            files.entitlements,
+        )));
     }
     let mut recorder = Recorder::open(log.unwrap_or_else(writ_recorder::default_log_path))?;
     recorder.set_fsync(fsync);
-    Ok(Box::new(LocalBackend::new(recorder, LoadedPolicy::parse(&policy)?)))
+    let entitlements = files
+        .entitlements
+        .as_deref()
+        .map(LoadedEntitlements::parse)
+        .transpose()?;
+    Ok(Box::new(LocalBackend::new(
+        recorder,
+        LoadedPolicy::parse(&files.policy)?,
+        entitlements,
+    )))
 }
 
-fn run_task(policy: &Path, log: Option<&Path>, command: &[String]) -> Result<ExitCode> {
-    let policy = read_policy(policy)?;
+fn run_task(policy: &Path, principal: Option<&str>, log: Option<&Path>, command: &[String]) -> Result<ExitCode> {
+    let files = read_policy(policy)?;
     let socket = writ_daemon::default_socket_path();
     // The connection stays open while the agent runs: if writ run dies, writd ends the task.
     let mut client = Client::connect_or_start(&socket, log)?;
@@ -217,7 +288,7 @@ fn run_task(policy: &Path, log: Option<&Path>, command: &[String]) -> Result<Exi
         "user": std::env::var("USER").ok(),
         "cwd": std::env::current_dir().ok(),
     });
-    let task = client.create_task(&policy, meta)?;
+    let task = client.create_task(&files.policy, files.entitlements.as_deref(), principal, meta)?;
 
     let (program, args) = command.split_first().context("no command given")?;
     let mut child = Command::new(program)
@@ -265,8 +336,8 @@ fn ps() -> Result<ExitCode> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     println!(
-        "{:<28}  {:<10}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  COMMAND",
-        "TASK", "USER", "NAMESPACE", "SESSIONS", "CALLS", "DENIED", "TAINTED", "AGE", "SERVERS"
+        "{:<28}  {:<10}  {:<20}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  COMMAND",
+        "TASK", "USER", "PRINCIPAL", "NAMESPACE", "SESSIONS", "CALLS", "DENIED", "TAINTED", "AGE", "SERVERS"
     );
     for t in tasks {
         let calls = match t.max_tool_calls {
@@ -284,9 +355,11 @@ fn ps() -> Result<ExitCode> {
             t.servers.join(",")
         };
         println!(
-            "{:<28}  {:<10}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  {}",
+            "{:<28}  {:<10}  {:<20}  {:<18}  {:>8}  {:>11}  {:>6}  {:<7}  {:>8}  {:<24}  {}",
             t.task,
             t.meta["user"].as_str().unwrap_or("-"),
+            // Asserted by whoever ran `writ run`; marked until roots are verified.
+            t.principal.as_deref().map_or("-".to_string(), |p| format!("{p}?")),
             t.namespace,
             t.sessions,
             calls,
@@ -342,11 +415,15 @@ fn format_entry(entry: &Entry) -> String {
     };
     let summary = match entry.kind.as_str() {
         "task_start" => format!(
-            "{} (policy {} sha256:{:.12})",
+            "{}{} (policy {} sha256:{:.12})",
             if d["implicit"] == json!(true) {
                 "implicit task".to_string()
             } else {
                 command(&d["meta"]["command"])
+            },
+            match d["root"]["principal"].as_str() {
+                Some(p) => format!(" for {p} (unverified)"),
+                None => String::new(),
             },
             s(&d["namespace"]),
             s(&d["policy_sha256"]),

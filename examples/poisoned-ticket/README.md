@@ -1,6 +1,6 @@
 # Demo: the poisoned ticket
 
-**Status: target, not yet runnable.** The policy here uses syntax this build doesn't enforce yet, so it's rejected when it loads. `ROADMAP.md` steps 2–6 make it work. The end-to-end test `crates/writ-cli/tests/demo.rs` is the definition of done.
+**Status: runs except for approvals.** Taint and entitlements work. The `approvals:` block is still rejected when the policy loads; without it, steps 5 and 6 below are refused instead of paused. `ROADMAP.md` step 6 adds approvals and `writ sudo`. The end-to-end tests in `crates/writ-cli/tests/demo.rs` are the definition of done.
 
 ## The story
 

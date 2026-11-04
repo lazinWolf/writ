@@ -1,9 +1,9 @@
 # The poisoned-ticket demo policy (plan-v2.md §7.1, scenario 1).
 #
-# DRAFT SYNTAX: this file describes the target, and today's build rejects it
-# at load time (data_flow, privileged, lookup, entitlements, ... are not
-# enforced yet). ROADMAP.md steps 2–6 make it load and enforce, one feature
-# at a time. The end-to-end test `crates/writ-cli/tests/demo.rs` runs it.
+# Today's build enforces everything here except `approvals:`, which is
+# rejected at load time until approvals land (ROADMAP.md step 6). Without that
+# block, calls that need a human are refused instead of paused; the test
+# `poisoned_ticket_without_approvals` in crates/writ-cli/tests/demo.rs runs it.
 #
 # Precedence (D9): every matching rule is evaluated and the most restrictive
 # outcome wins: deny > require_sudo > allow.

@@ -14,6 +14,13 @@ pub enum Request {
     /// Create a root task from policy text. Returns `{"task": id}`.
     CreateTask {
         policy: String,
+        /// The text of the policy's entitlement source, if it declares one.
+        /// Read by the caller, which knows where the policy file lives.
+        #[serde(default)]
+        entitlements: Option<String>,
+        /// The root principal (unverified).
+        #[serde(default)]
+        principal: Option<String>,
         meta: Value,
     },
     EndTask {
@@ -25,6 +32,9 @@ pub enum Request {
         policy: Option<String>,
         /// The wrapped server's name; the session is `mcp:<name>`.
         name: String,
+        /// Without a task: the text of `policy`'s entitlement source, if any.
+        #[serde(default)]
+        entitlements: Option<String>,
         info: Value,
     },
     /// Returns a `writ_policy::Decision`.

@@ -114,11 +114,13 @@ Each item is sized to be one PR. Start at the top.
 
 ### Step 5: Entitlements with a mock resolver (about 3–4 days)
 
-- [ ] Add `writ run --principal <id>`. The root principal is recorded and **labeled unverified** in the log and in `writ ps` until IdP-verified roots exist (plan-v2 §4.1).
-- [ ] Add `trait EntitlementResolver { fn resolve(&self, principal) -> Value }` with a `FileResolver` that reads YAML (`principal → {entitled_customers: [...], ...}`). The result becomes `writ.root.*`.
-- [ ] Accept the rule field `entitlements:` (conditions over `writ.root.*` and `args.*`) plus `on_entitlement_violation: deny`, and remove them from `UNIMPLEMENTED_RULE`.
-- [ ] Add a fact lookup for `stripe.get_charge`-style references (`charge.customer`) via the resolver. The mock first; the real Stripe API goes behind the same trait in Phase 1.
-- [ ] Turn on the "another customer's charge → denied" case in `demo.rs`.
+- [x] Add `writ run --principal <id>`. The root principal is recorded and **labeled unverified** in the log and in `writ ps` until IdP-verified roots exist (plan-v2 §4.1).
+- [x] Add `trait EntitlementResolver { fn resolve(&self, principal) -> Value }` with a `FileResolver` that reads YAML (`principal → {entitled_customers: [...], ...}`). The result becomes `writ.root.*`.
+- [x] Accept the rule field `entitlements:` (conditions over `writ.root.*` and `args.*`) plus `on_entitlement_violation: deny`, and remove them from `UNIMPLEMENTED_RULE`.
+- [x] Add a fact lookup for `stripe.get_charge`-style references (`charge.customer`) via the resolver. The mock first; the real Stripe API goes behind the same trait in Phase 1.
+- [x] Turn on the "another customer's charge → denied" case in `demo.rs`.
+
+**Step 5 status:** done. The trait is `writ_policy::EntitlementSource` (with `FileSource`); the policy names it with `entitlements: {source: file, path}`, and rules bind records with `lookup:`. `writ run` reads both files once and writd records their hashes. A call whose entitlements all hold is *covered*, so taint doesn't add an approval for it. `poisoned_ticket_without_approvals` runs the whole demo today, with the two calls that need a human refused. The full demo test stops only at `approvals:`.
 
 ### Step 6: Asynchronous decisions and a CLI approval broker (blocker 2, about 1 week)
 

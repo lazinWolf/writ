@@ -1,7 +1,8 @@
 //! The poisoned-ticket demo (plan-v2.md scenario 1, `examples/poisoned-ticket`).
 //!
 //! `poisoned_ticket_demo` is the definition of done for ROADMAP.md steps 2–6,
-//! and is ignored until they land. Run it with:
+//! and is ignored until step 6 (approvals) lands. `poisoned_ticket_without_approvals`
+//! runs everything else today. Run it with:
 //!
 //! ```text
 //! cargo test -p writ-cli --test demo -- --ignored
@@ -167,6 +168,73 @@ fn demo_fixtures_behave() {
     }
 }
 
+/// Everything in the demo except approvals (ROADMAP.md step 6): the demo
+/// policy with its `approvals:` block removed, so calls that need a human
+/// are refused instead of paused. Runs today.
+#[test]
+fn poisoned_ticket_without_approvals() {
+    require_python!();
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let demo = std::fs::read_to_string(example("writ.yaml")).unwrap();
+    let start = demo.find("approvals:").expect("demo policy has an approvals block");
+    let end = start + demo[start..].find("\n\n").unwrap();
+    std::fs::write(path("writ.yaml"), format!("{}{}", &demo[..start], &demo[end + 2..])).unwrap();
+    std::fs::copy(example("entitlements.yaml"), path("entitlements.yaml")).unwrap();
+    let _stop = StopWritd(path("run/writd.sock"));
+    let writ = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
+        cmd.env("WRIT_SOCKET", path("run/writd.sock"))
+            .env("WRIT_LOG", path("flight.jsonl"))
+            .env_remove("WRIT_TASK");
+        cmd
+    };
+
+    let out = writ()
+        .args(["run", "--principal", "alice@example.com", "--policy"])
+        .arg(path("writ.yaml"))
+        .args(["--", "python3", "-I"])
+        .arg(fixture("demo_agent.py"))
+        .env("WRIT_BIN", env!("CARGO_BIN_EXE_writ"))
+        .env("DRIVER_OUT", path("driver.json"))
+        .env("STRIPE_LEDGER", path("ledger.jsonl"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "writ run failed: {}", stderr(&out));
+
+    let driver: Value = serde_json::from_str(&std::fs::read_to_string(path("driver.json")).unwrap()).unwrap();
+    let r = &driver["results"];
+    let allowed = |label: &str| assert!(!is_error(&r[label]), "{label} should be allowed: {}", r[label]);
+    let refused = |label: &str, why: &str| {
+        assert!(is_error(&r[label]), "{label} should be refused: {}", r[label]);
+        assert!(
+            text(&r[label]).contains(why),
+            "{label}: expected `{why}` in {}",
+            r[label]
+        );
+    };
+    allowed("credit_before_ticket");
+    allowed("read_ticket");
+    refused("injected_refund", "outside the root's entitlement");
+    allowed("small_refund");
+    // With no approval broker, the calls that need a human are refused.
+    refused("large_refund", "requires approval");
+    refused("credit_after_ticket", "tainted");
+
+    assert_eq!(
+        read_jsonl(&path("ledger.jsonl")),
+        [
+            json!({ "op": "credit", "customer": "cus_alice", "amount": 10 }),
+            json!({ "op": "refund", "charge": "ch_alice_small", "customer": "cus_alice", "amount": 40.0 }),
+        ]
+    );
+    let log = read_jsonl(&path("flight.jsonl"));
+    let start = log.iter().find(|e| e["kind"] == "task_start").unwrap();
+    assert_eq!(start["data"]["root"]["principal"], "alice@example.com");
+    assert_eq!(start["data"]["root"]["verified"], false);
+    assert_eq!(log.iter().filter(|e| e["kind"] == "taint").count(), 1);
+}
+
 /// Stops the writd that `writ run` started for this test.
 struct StopWritd(PathBuf);
 
@@ -198,7 +266,7 @@ fn next_pending(writ: &dyn Fn() -> Command, agent: &mut Child, deadline: Instant
 }
 
 #[test]
-#[ignore = "target for ROADMAP.md steps 2-6: needs --name, --principal, taint, entitlements, and writ sudo"]
+#[ignore = "target for ROADMAP.md step 6: needs approvals and writ sudo"]
 fn poisoned_ticket_demo() {
     require_python!();
     let dir = tempfile::tempdir().unwrap();

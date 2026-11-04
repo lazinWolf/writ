@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
-use writ_daemon::{Client, Engine, LoadedPolicy};
+use writ_daemon::{Client, Engine, LoadedEntitlements, LoadedPolicy};
 use writ_policy::Decision;
 use writ_recorder::Recorder;
 
@@ -23,14 +23,16 @@ pub trait Backend: Send {
 pub struct LocalBackend {
     engine: Engine,
     policy: Option<LoadedPolicy>,
+    entitlements: Option<LoadedEntitlements>,
     session: Option<String>,
 }
 
 impl LocalBackend {
-    pub fn new(recorder: Recorder, policy: LoadedPolicy) -> Self {
+    pub fn new(recorder: Recorder, policy: LoadedPolicy, entitlements: Option<LoadedEntitlements>) -> Self {
         LocalBackend {
             engine: Engine::new(recorder),
             policy: Some(policy),
+            entitlements,
             session: None,
         }
     }
@@ -42,7 +44,9 @@ impl LocalBackend {
 
 impl Backend for LocalBackend {
     fn open(&mut self, name: &str, info: Value) -> Result<String> {
-        let session = self.engine.open_session(None, self.policy.take(), name, info)?;
+        let session = self
+            .engine
+            .open_session(None, self.policy.take(), self.entitlements.take(), name, info)?;
         self.session = Some(session.clone());
         Ok(session)
     }
@@ -73,18 +77,30 @@ pub struct DaemonBackend {
     client: Client,
     task: Option<String>,
     policy: Option<String>,
+    entitlements: Option<String>,
 }
 
 impl DaemonBackend {
-    pub fn new(client: Client, task: Option<String>, policy: Option<String>) -> Self {
-        DaemonBackend { client, task, policy }
+    /// `entitlements` is the text of `policy`'s entitlement source, if it declares one.
+    pub fn new(client: Client, task: Option<String>, policy: Option<String>, entitlements: Option<String>) -> Self {
+        DaemonBackend {
+            client,
+            task,
+            policy,
+            entitlements,
+        }
     }
 }
 
 impl Backend for DaemonBackend {
     fn open(&mut self, name: &str, info: Value) -> Result<String> {
-        self.client
-            .open_session(self.task.as_deref(), self.policy.as_deref(), name, info)
+        self.client.open_session(
+            self.task.as_deref(),
+            self.policy.as_deref(),
+            self.entitlements.as_deref(),
+            name,
+            info,
+        )
     }
 
     fn decide(&mut self, call_id: &Value, tool: &str, args: &Value) -> Result<Decision> {

@@ -2,7 +2,9 @@
 //!
 //! This build implements a subset of the spec in `plan-v2.md` §7.1: tool
 //! rules with conditions over the call's arguments (`args.*`) and the task's
-//! facts (`writ.*`, see [`Facts`]), and the `max_tool_calls` limit. Fields the
+//! facts (`writ.*`, see [`Facts`]), entitlements checked against an
+//! entitlement source (see [`entitlements`]), coarse taint, and the
+//! `max_tool_calls` limit. Fields the
 //! spec defines but this build does not enforce are rejected at load time, so
 //! a policy never appears to grant a guarantee it does not have.
 //!
@@ -12,9 +14,11 @@
 
 mod condition;
 mod context;
+pub mod entitlements;
 mod glob;
 mod redact;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +27,7 @@ use serde_json::Value;
 pub use condition::Condition;
 use context::Scope;
 pub use context::{DecisionContext, Facts, Root, SessionFacts, session_source, validate_session_name};
+pub use entitlements::{EntitlementSource, FileSource};
 pub use redact::MARKER as REDACTED;
 use redact::RedactPath;
 
@@ -37,14 +42,12 @@ pub enum PolicyError {
 }
 
 /// Spec fields that are part of writ.yaml but not enforced by this build.
-const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &["entitlements", "approvals"];
+const UNIMPLEMENTED_TOP_LEVEL: &[&str] = &["approvals"];
 const UNIMPLEMENTED_DATA_FLOW: &[&str] = &["secrets", "pii_fields", "declassify"];
 const UNIMPLEMENTED_ON_TAINT: &[&str] = &["other_mutations", "egress_to_untrusted_sinks"];
 const UNIMPLEMENTED_LIMITS: &[&str] = &["max_depth", "max_parallel_agents", "max_budget_usd", "loop_breaker"];
 const UNIMPLEMENTED_RULE: &[&str] = &[
     "idempotency",
-    "lookup",
-    "entitlements",
     "preconditions",
     "classify",
     "deny_statements",
@@ -52,7 +55,6 @@ const UNIMPLEMENTED_RULE: &[&str] = &[
     "pin_tenant_from_writ",
     "mutations",
     "sudo_approvers",
-    "on_entitlement_violation",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -103,9 +105,22 @@ pub struct Limits {
 }
 
 #[derive(Debug, Clone)]
+struct Lookup {
+    name: String,
+    table: String,
+    key: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct Rule {
     pattern: String,
     action: Action,
+    /// Bound before any condition is checked, in name order.
+    lookups: Vec<Lookup>,
+    /// Bounds from the root principal's authority. When they all hold, the
+    /// call is *covered*: taint doesn't add an approval requirement.
+    entitlements: Vec<Condition>,
+    on_entitlement_violation: Violation,
     conditions: Vec<Condition>,
     on_violation: Violation,
     redact: Vec<RedactPath>,
@@ -137,6 +152,8 @@ pub struct Policy {
     pub untrusted_sources: Vec<String>,
     /// What a privileged tool gets on a tainted task.
     on_taint_privileged: Outcome,
+    /// Where `writ.root.*` and lookups come from, if anywhere.
+    pub entitlements: Option<EntitlementsSpec>,
     rules: Vec<Rule>,
     fallback: Option<Rule>,
 }
@@ -153,7 +170,31 @@ struct RawPolicy {
     #[serde(default)]
     data_flow: RawDataFlow,
     #[serde(default)]
+    entitlements: Option<EntitlementsSpec>,
+    #[serde(default)]
     capabilities: Vec<RawRule>,
+}
+
+/// The policy's `entitlements:` block.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntitlementsSpec {
+    pub source: SourceKind,
+    /// For `source: file`: the file, relative to the policy file.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    File,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLookup {
+    table: String,
+    key: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -192,6 +233,12 @@ struct RawRule {
     tool: String,
     #[serde(default)]
     action: Action,
+    #[serde(default)]
+    lookup: BTreeMap<String, RawLookup>,
+    #[serde(default)]
+    entitlements: Vec<String>,
+    #[serde(default)]
+    on_entitlement_violation: Option<Violation>,
     #[serde(default)]
     conditions: Vec<String>,
     #[serde(default)]
@@ -262,6 +309,7 @@ impl Policy {
                 TaintAction::RequireSudo => Outcome::RequireSudo,
                 TaintAction::Deny => Outcome::Deny,
             },
+            entitlements: raw.entitlements,
             limits: Limits {
                 max_tool_calls: raw.limits.max_tool_calls,
             },
@@ -284,15 +332,27 @@ impl Policy {
 
         let recording = Self::recording(&candidates);
         let scope = Scope::new(ctx);
-        let mut decisions = candidates.iter().map(|rule| rule.decide(&scope, &recording));
-        let first = decisions.next().expect("candidates is non-empty");
-        // `max_by_key` keeps the last maximum; fold keeps the first, so the
-        // reported rule is the earliest of the most restrictive ones.
-        let best = decisions.fold(first, |best, d| if d.outcome > best.outcome { d } else { best });
+        let decided: Vec<(Decision, bool)> = candidates
+            .iter()
+            .map(|rule| rule.decide(&scope, ctx.source, &recording))
+            .collect();
+        // Keep the first of the most restrictive, so the reported rule is the earliest one.
+        let best = decided
+            .iter()
+            .map(|(d, _)| d)
+            .fold(&decided[0].0, |best, d| if d.outcome > best.outcome { d } else { best })
+            .clone();
 
         // A privileged tool on a tainted task: the task has read content that
         // may be attacker-written, so its arguments may be attacker-steered.
-        match candidates.iter().find(|r| r.privileged) {
+        // A rule whose entitlements all held covers the call: it is within the
+        // root principal's own authority, so taint adds no approval.
+        let uncovered = candidates
+            .iter()
+            .zip(&decided)
+            .find(|(rule, (_, covered))| rule.privileged && !covered)
+            .map(|(rule, _)| rule);
+        match uncovered {
             Some(rule) if ctx.facts.tainted && self.on_taint_privileged > best.outcome => Decision {
                 outcome: self.on_taint_privileged,
                 rule: Some(rule.pattern.clone()),
@@ -303,6 +363,20 @@ impl Policy {
             },
             _ => best,
         }
+    }
+
+    /// The tables this policy's lookups read, so a task can check its source
+    /// has them before it starts.
+    pub fn lookup_tables(&self) -> Vec<&str> {
+        let mut tables: Vec<&str> = self
+            .rules
+            .iter()
+            .chain(&self.fallback)
+            .flat_map(|r| r.lookups.iter().map(|l| l.table.as_str()))
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        tables
     }
 
     /// True when content from `source` (`mcp:<name>`) may be attacker-written.
@@ -355,17 +429,47 @@ impl Rule {
         if raw.tool.trim().is_empty() {
             return Err(invalid("a capability rule has an empty `tool` pattern".to_string()));
         }
-        if raw.action == Action::Deny && !raw.conditions.is_empty() {
+        let tool = &raw.tool;
+        if raw.action == Action::Deny
+            && (!raw.conditions.is_empty() || !raw.entitlements.is_empty() || !raw.lookup.is_empty())
+        {
             return Err(invalid(format!(
-                "rule `{}`: conditions on a deny rule have no effect; remove them",
-                raw.tool
+                "rule `{tool}`: conditions, entitlements, and lookups on a deny rule have no effect; remove them"
             )));
         }
-        let conditions = raw
-            .conditions
-            .iter()
-            .map(|c| Condition::parse(c).map_err(|e| invalid(format!("rule `{}`: condition `{c}`: {e}", raw.tool))))
-            .collect::<Result<_, _>>()?;
+        if raw.entitlements.is_empty() && raw.on_entitlement_violation.is_some() {
+            return Err(invalid(format!(
+                "rule `{tool}`: `on_entitlement_violation` without `entitlements` has no effect"
+            )));
+        }
+        let mut lookups = Vec::new();
+        for (name, l) in &raw.lookup {
+            let valid_name = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && name.starts_with(|c: char| c.is_ascii_alphabetic());
+            if !valid_name || name == "args" || name == "writ" {
+                return Err(invalid(format!(
+                    "rule `{tool}`: lookup name `{name}` must be a plain identifier other than `args` or `writ`"
+                )));
+            }
+            let key = condition::parse_key_path(&l.key)
+                .map_err(|e| invalid(format!("rule `{tool}`: lookup `{name}`: {e}")))?;
+            lookups.push(Lookup {
+                name: name.clone(),
+                table: l.table.clone(),
+                key,
+            });
+        }
+        let bindings: Vec<String> = raw.lookup.keys().cloned().collect();
+        let parse_all = |list: &[String], what: &str| -> Result<Vec<Condition>, PolicyError> {
+            list.iter()
+                .map(|c| {
+                    Condition::parse_with(c, &bindings)
+                        .map_err(|e| invalid(format!("rule `{tool}`: {what} `{c}`: {e}")))
+                })
+                .collect()
+        };
+        let entitlements = parse_all(&raw.entitlements, "entitlement")?;
+        let conditions = parse_all(&raw.conditions, "condition")?;
         let redact = raw
             .redact
             .iter()
@@ -374,6 +478,9 @@ impl Rule {
         Ok(Rule {
             pattern: raw.tool,
             action: raw.action,
+            lookups,
+            entitlements,
+            on_entitlement_violation: raw.on_entitlement_violation.unwrap_or_default(),
             conditions,
             on_violation: raw.on_violation,
             redact,
@@ -382,35 +489,98 @@ impl Rule {
         })
     }
 
-    fn decide(&self, scope: &Scope, recording: &Recording) -> Decision {
+    /// Decides the call under this rule alone. The flag is true when the rule
+    /// has entitlements and they all held (the call is *covered*).
+    fn decide(&self, base: &Scope, source: Option<&dyn EntitlementSource>, recording: &Recording) -> (Decision, bool) {
         let rule = Some(self.pattern.clone());
         if self.action == Action::Deny {
-            return Decision {
-                outcome: Outcome::Deny,
-                rule,
-                reason: format!("denied by rule `{}`", self.pattern),
-            };
+            let reason = format!("denied by rule `{}`", self.pattern);
+            return (
+                Decision {
+                    outcome: Outcome::Deny,
+                    rule,
+                    reason,
+                },
+                false,
+            );
         }
-        for condition in &self.conditions {
-            if let Err(reason) = condition.check(scope) {
-                // Decision reasons are recorded, so they must not echo a redacted value.
-                let reason = if condition.arg_paths().any(|p| recording.hides(p)) {
-                    format!("`{condition}` failed (value redacted)")
-                } else {
-                    reason
-                };
-                let outcome = match self.on_violation {
-                    Violation::Deny => Outcome::Deny,
-                    Violation::RequireSudo => Outcome::RequireSudo,
-                };
-                return Decision { outcome, rule, reason };
+
+        // Bind lookups. A miss leaves the name unbound, so every condition
+        // reading it fails closed; the miss is explained in the reason.
+        let mut scope = base.clone();
+        let mut misses = Vec::new();
+        for lookup in &self.lookups {
+            let key_path = lookup.key.join(".");
+            let key_hidden = lookup.key[0] == "args" && recording.hides(&lookup.key[1..]);
+            let key = base.get(&lookup.key).and_then(|k| match k {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            });
+            let found = match (&key, source) {
+                (Some(key), Some(source)) => source.lookup(&lookup.table, key),
+                _ => None,
+            };
+            match found {
+                Some(value) => scope.bind(&lookup.name, value),
+                None => misses.push(match (&key, source, key_hidden) {
+                    (_, None, _) => format!("`{}`: no entitlement source", lookup.name),
+                    (None, _, _) => format!("`{}`: {key_path} is missing or not a string", lookup.name),
+                    (Some(_), _, true) => format!("`{}`: no `{}` entry for {key_path}", lookup.name, lookup.table),
+                    (Some(key), _, false) => {
+                        format!(
+                            "`{}`: no `{}` entry for {key_path} = {key:?}",
+                            lookup.name, lookup.table
+                        )
+                    }
+                }),
             }
         }
-        Decision {
-            outcome: Outcome::Allow,
-            rule,
-            reason: format!("allowed by rule `{}`", self.pattern),
+        let explain = |condition: &Condition, reason: String| {
+            // Decision reasons are recorded, so they must not echo a redacted value.
+            let mut reason = if condition.arg_paths().any(|p| recording.hides(p)) {
+                format!("`{condition}` failed (value redacted)")
+            } else {
+                reason
+            };
+            if !misses.is_empty() {
+                reason.push_str(&format!(" (lookup {})", misses.join("; ")));
+            }
+            reason
+        };
+        let outcome_of = |violation: Violation| match violation {
+            Violation::Deny => Outcome::Deny,
+            Violation::RequireSudo => Outcome::RequireSudo,
+        };
+
+        for entitlement in &self.entitlements {
+            if let Err(reason) = entitlement.check(&scope) {
+                let reason = format!("outside the root's entitlement: {}", explain(entitlement, reason));
+                let outcome = outcome_of(self.on_entitlement_violation);
+                return (Decision { outcome, rule, reason }, false);
+            }
         }
+        let covered = !self.entitlements.is_empty();
+        for condition in &self.conditions {
+            if let Err(reason) = condition.check(&scope) {
+                let reason = explain(condition, reason);
+                let outcome = outcome_of(self.on_violation);
+                return (Decision { outcome, rule, reason }, covered);
+            }
+        }
+        let reason = if covered {
+            format!("allowed by rule `{}` (within the root's entitlement)", self.pattern)
+        } else {
+            format!("allowed by rule `{}`", self.pattern)
+        };
+        (
+            Decision {
+                outcome: Outcome::Allow,
+                rule,
+                reason,
+            },
+            covered,
+        )
     }
 }
 
@@ -563,8 +733,8 @@ capabilities:
                 "limits.max_depth",
             ),
             (
-                "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    lookup: {}\n",
-                "lookup",
+                "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    preconditions: []\n",
+                "preconditions",
             ),
         ];
         for (yaml, field) in cases {
@@ -738,6 +908,152 @@ capabilities:
         assert_eq!(d.outcome, Outcome::Deny);
     }
 
+    const REFUNDS: &str = r#"
+version: 1
+namespace: t
+entitlements:
+  source: file
+  path: entitlements.yaml
+capabilities:
+  - tool: "stripe.refund"
+    privileged: true
+    lookup:
+      charge: { table: charges, key: args.charge }
+    entitlements:
+      - "charge.customer in writ.root.entitled_customers"
+      - "args.amount <= charge.amount"
+    on_entitlement_violation: deny
+    conditions:
+      - "args.amount <= 100.00"
+    on_violation: require_sudo
+  - tool: "stripe.add_credit"
+    privileged: true
+"#;
+
+    const SOURCE: &str = r#"
+principals:
+  alice:
+    entitled_customers: [cus_alice]
+tables:
+  charges:
+    ch_alice_small: { customer: cus_alice, amount: 40.00 }
+    ch_alice_big: { customer: cus_alice, amount: 240.00 }
+    ch_bob: { customer: cus_bob, amount: 5000.00 }
+"#;
+
+    fn alice(source: &FileSource, tainted: bool) -> Facts {
+        Facts {
+            root: Some(Root {
+                principal: "alice".into(),
+                verified: false,
+                attributes: source.root_attributes("alice").unwrap(),
+            }),
+            tainted,
+            taint_sources: if tainted { vec!["mcp:zendesk".into()] } else { vec![] },
+            ..Facts::default()
+        }
+    }
+
+    #[test]
+    fn entitlements_bound_privileged_calls_by_the_root() {
+        let p = Policy::from_yaml_str(REFUNDS).unwrap();
+        assert_eq!(
+            p.entitlements,
+            Some(EntitlementsSpec {
+                source: SourceKind::File,
+                path: "entitlements.yaml".into()
+            })
+        );
+        assert_eq!(p.lookup_tables(), ["charges"]);
+        let source = FileSource::from_yaml_str(SOURCE).unwrap();
+        let decide = |facts: &Facts, tool: &str, args: Value| {
+            p.evaluate(&DecisionContext::new(tool, &args, facts).with_source(Some(&source)))
+        };
+
+        for tainted in [false, true] {
+            let facts = alice(&source, tainted);
+            // Somebody else's charge: denied, tainted or not, and no human is asked.
+            let d = decide(&facts, "stripe.refund", json!({"charge": "ch_bob", "amount": 5000.0}));
+            assert_eq!(d.outcome, Outcome::Deny, "{}", d.reason);
+            assert!(d.reason.contains("outside the root's entitlement"), "{}", d.reason);
+            assert!(d.reason.contains("charge.customer = \"cus_bob\""), "{}", d.reason);
+            // More than the charge: denied.
+            let d = decide(
+                &facts,
+                "stripe.refund",
+                json!({"charge": "ch_alice_small", "amount": 41.0}),
+            );
+            assert_eq!(d.outcome, Outcome::Deny, "{}", d.reason);
+            // Alice's own small charge: allowed, even on a tainted task (covered).
+            let d = decide(
+                &facts,
+                "stripe.refund",
+                json!({"charge": "ch_alice_small", "amount": 40.0}),
+            );
+            assert_eq!(d.outcome, Outcome::Allow, "tainted={tainted}: {}", d.reason);
+            assert!(d.reason.contains("within the root's entitlement"), "{}", d.reason);
+            // Alice's own large charge: over the auto-limit, so a human decides.
+            let d = decide(
+                &facts,
+                "stripe.refund",
+                json!({"charge": "ch_alice_big", "amount": 240.0}),
+            );
+            assert_eq!(d.outcome, Outcome::RequireSudo, "{}", d.reason);
+            assert!(d.reason.contains("args.amount <= 100.00"), "{}", d.reason);
+        }
+
+        // A privileged tool with no entitlements isn't covered: taint needs a human.
+        let clean = decide(&alice(&source, false), "stripe.add_credit", json!({}));
+        assert_eq!(clean.outcome, Outcome::Allow);
+        let tainted = decide(&alice(&source, true), "stripe.add_credit", json!({}));
+        assert_eq!(tainted.outcome, Outcome::RequireSudo);
+        assert!(tainted.reason.contains("tainted"), "{}", tainted.reason);
+    }
+
+    #[test]
+    fn entitlements_fail_closed() {
+        let p = Policy::from_yaml_str(REFUNDS).unwrap();
+        let source = FileSource::from_yaml_str(SOURCE).unwrap();
+        let args = json!({"charge": "ch_alice_small", "amount": 40.0});
+        let ctx = |facts: &'static Facts| DecisionContext::new("stripe.refund", &args, facts);
+
+        // No root principal.
+        static NO_ROOT: std::sync::LazyLock<Facts> = std::sync::LazyLock::new(Facts::default);
+        let d = p.evaluate(&ctx(&NO_ROOT).with_source(Some(&source)));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(
+            d.reason.contains("writ.root.entitled_customers is missing"),
+            "{}",
+            d.reason
+        );
+
+        // No source at all.
+        let facts = alice(&source, false);
+        let d = p.evaluate(&DecisionContext::new("stripe.refund", &args, &facts));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("no entitlement source"), "{}", d.reason);
+
+        // An unknown charge.
+        let unknown = json!({"charge": "ch_nope", "amount": 1.0});
+        let d = p.evaluate(&DecisionContext::new("stripe.refund", &unknown, &facts).with_source(Some(&source)));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(
+            d.reason.contains("no `charges` entry for args.charge = \"ch_nope\""),
+            "{}",
+            d.reason
+        );
+
+        // A redacted key isn't echoed.
+        let redacting = Policy::from_yaml_str(&REFUNDS.replace(
+            "    privileged: true\n    lookup:",
+            "    privileged: true\n    redact: [\"args.charge\"]\n    lookup:",
+        ))
+        .unwrap();
+        let d = redacting.evaluate(&DecisionContext::new("stripe.refund", &unknown, &facts).with_source(Some(&source)));
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(!d.reason.contains("ch_nope"), "{}", d.reason);
+    }
+
     #[test]
     fn rejects_invalid_policies() {
         for yaml in [
@@ -750,6 +1066,12 @@ capabilities:
             "version: 1\nnamespace: t\ndata_flow:\n  untrusted_sources: [\"postgres:public.notes\"]\n",
             "version: 1\nnamespace: t\ndata_flow:\n  untrusted_sources: [\"mcp:bad name\"]\n",
             "version: 1\nnamespace: t\ndata_flow:\n  on_taint:\n    privileged_mutations: allow\n",
+            "version: 1\nnamespace: t\nentitlements:\n  source: ldap\n  path: x\n",
+            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    entitlements: [\"charge.c == 1\"]\n",
+            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    lookup:\n      args: { table: t, key: args.a }\n",
+            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    lookup:\n      c: { table: t, key: c.a }\n",
+            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    on_entitlement_violation: deny\n",
+            "version: 1\nnamespace: t\ncapabilities:\n  - tool: x\n    action: deny\n    entitlements: [\"args.a == 1\"]\n",
         ] {
             assert!(Policy::from_yaml_str(yaml).is_err(), "accepted: {yaml}");
         }

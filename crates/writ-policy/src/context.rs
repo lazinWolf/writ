@@ -12,6 +12,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::EntitlementSource;
+
 /// The root of a task's authority: who the task acts for.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Root {
@@ -84,18 +86,33 @@ pub struct DecisionContext<'a> {
     pub tool: &'a str,
     pub args: &'a Value,
     pub facts: &'a Facts,
+    /// Answers rules' `lookup:`s. Without one, every lookup finds nothing,
+    /// so conditions that read a lookup fail closed.
+    pub source: Option<&'a dyn EntitlementSource>,
 }
 
 impl<'a> DecisionContext<'a> {
     pub fn new(tool: &'a str, args: &'a Value, facts: &'a Facts) -> Self {
-        DecisionContext { tool, args, facts }
+        DecisionContext {
+            tool,
+            args,
+            facts,
+            source: None,
+        }
+    }
+
+    pub fn with_source(self, source: Option<&'a dyn EntitlementSource>) -> Self {
+        DecisionContext { source, ..self }
     }
 }
 
-/// The values conditions resolve paths against: `args` and `writ`.
+/// The values conditions resolve paths against: `args`, `writ`, and the
+/// names a rule's `lookup:` bound.
+#[derive(Clone)]
 pub(crate) struct Scope<'a> {
     args: &'a Value,
     writ: Value,
+    bindings: Map<String, Value>,
 }
 
 impl<'a> Scope<'a> {
@@ -103,16 +120,22 @@ impl<'a> Scope<'a> {
         Scope {
             args: ctx.args,
             writ: serde_json::to_value(ctx.facts).expect("facts serialize"),
+            bindings: Map::new(),
         }
     }
 
-    /// Resolves a path whose first segment is `args` or `writ`.
+    /// This scope plus `name` bound to `value`.
+    pub(crate) fn bind(&mut self, name: &str, value: Value) {
+        self.bindings.insert(name.to_string(), value);
+    }
+
+    /// Resolves a path whose first segment is `args`, `writ`, or a bound name.
     pub(crate) fn get(&self, path: &[String]) -> Option<&Value> {
         let (first, rest) = path.split_first()?;
         let mut current = match first.as_str() {
             "args" => self.args,
             "writ" => &self.writ,
-            _ => return None,
+            name => self.bindings.get(name)?,
         };
         for segment in rest {
             current = match current {

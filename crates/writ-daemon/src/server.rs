@@ -6,7 +6,7 @@ use std::thread;
 
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, EngineError, LoadedPolicy};
+use crate::engine::{Authority, Engine, EngineError, LoadedEntitlements, LoadedPolicy};
 use crate::protocol::{Request, Response};
 
 /// Accepts connections forever, one thread per connection.
@@ -72,8 +72,17 @@ impl Connection {
 
     fn handle(&mut self, request: Request, engine: &mut Engine) -> Result<Value, EngineError> {
         match request {
-            Request::CreateTask { policy, meta } => {
-                let task = engine.create_task(LoadedPolicy::parse(&policy)?, meta)?;
+            Request::CreateTask {
+                policy,
+                entitlements,
+                principal,
+                meta,
+            } => {
+                let authority = Authority {
+                    principal,
+                    entitlements: entitlements.as_deref().map(LoadedEntitlements::parse).transpose()?,
+                };
+                let task = engine.create_task(LoadedPolicy::parse(&policy)?, authority, meta)?;
                 self.tasks.push(task.clone());
                 Ok(json!({ "task": task }))
             }
@@ -86,13 +95,20 @@ impl Connection {
                 task,
                 policy,
                 name,
+                entitlements,
                 info,
             } => {
                 if self.session.is_some() {
                     return Err(EngineError::Invalid("this connection already has a session".into()));
                 }
                 let policy = policy.as_deref().map(LoadedPolicy::parse).transpose()?;
-                let session = engine.open_session(task.as_deref(), policy, &name, info)?;
+                let session = engine.open_session(
+                    task.as_deref(),
+                    policy,
+                    entitlements.as_deref().map(LoadedEntitlements::parse).transpose()?,
+                    &name,
+                    info,
+                )?;
                 self.session = Some(session.clone());
                 Ok(json!({ "session": session }))
             }
