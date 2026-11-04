@@ -80,12 +80,39 @@ pub enum Request {
         approve: bool,
         approver: Value,
     },
+    /// Decides one action for a caller that keeps no connection open (a
+    /// Claude Code hook). Calls with the same `scope` share a task; see
+    /// `Engine::decide_scoped`. Returns a `writ_policy::Decision`.
+    Check(ScopedRequest),
+    /// Records that a checked action ran, tainting the task if its source is
+    /// untrusted. Returns null.
+    Executed(ScopedRequest),
     /// Blocks until the approval is settled or times out, then returns the
     /// final `writ_policy::Decision`. Send it on a connection of its own:
     /// nothing else on that connection is answered meanwhile.
     WaitApproval {
         id: String,
     },
+}
+
+/// One action, as a hook sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedRequest {
+    pub scope: String,
+    /// The policy's text, sent with every call: writd reuses the task while
+    /// the text is unchanged.
+    pub policy: String,
+    #[serde(default)]
+    pub entitlements: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub principal: Option<String>,
+    pub source: String,
+    pub tool: String,
+    pub args: Value,
+    #[serde(default)]
+    pub call_id: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

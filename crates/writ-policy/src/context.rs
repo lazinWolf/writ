@@ -43,6 +43,11 @@ pub struct Facts {
     /// `writ.session.*`: the wrapped server this call goes to.
     #[serde(default)]
     pub session: SessionFacts,
+    /// `writ.workspace`: the directory the task works in (an absolute path),
+    /// when the task has one: a Claude Code project, say. Absent otherwise,
+    /// so `args.path within writ.workspace` fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -78,7 +83,7 @@ pub fn validate_session_name(name: &str) -> Result<(), String> {
 
 /// The top-level `writ.*` fields a condition may read. Anything else is a
 /// policy error at load time, so a typo can't silently fail every call.
-pub(crate) const FACT_FIELDS: &[&str] = &["root", "tainted", "taint_sources", "session"];
+pub(crate) const FACT_FIELDS: &[&str] = &["root", "tainted", "taint_sources", "session", "workspace"];
 
 /// Everything one decision is made from.
 #[derive(Debug, Clone, Copy)]

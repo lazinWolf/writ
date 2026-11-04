@@ -1,3 +1,6 @@
+mod claude_code;
+mod init;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -92,6 +95,36 @@ enum Commands {
         #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
+    /// Put a project under writ: a starter writ.yaml (observe mode), writ's Claude Code hook,
+    /// and `writ wrap` around the stdio servers in .cursor/mcp.json.
+    Init {
+        /// The project directory [default: the current directory].
+        dir: Option<PathBuf>,
+        /// Start in enforce mode instead of observe mode.
+        #[arg(long)]
+        enforce: bool,
+        /// Replace an existing writ.yaml (it's backed up first).
+        #[arg(long)]
+        force: bool,
+        /// Remove writ's hook and unwrap servers. Keeps writ.yaml and the log.
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Summarize what policies decided: per tool, what was or would have been refused, and
+    /// privileged calls made after reading untrusted content.
+    Report {
+        /// Flight recorder file [default: $WRIT_LOG or ~/.local/state/writ/flight.jsonl].
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Only this task or session.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Decide an agent's tool calls from inside the agent's own hooks.
+    Hook {
+        #[command(subcommand)]
+        target: HookTarget,
+    },
     /// List live tasks.
     Ps,
     /// Decide calls waiting for approval (policies with an `approvals:` block, under writd).
@@ -133,6 +166,29 @@ enum Commands {
         /// Print raw JSON lines.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookTarget {
+    /// Claude Code's PreToolUse/PostToolUse hook: reads the call on stdin and answers it.
+    ///
+    /// Every Claude Code tool goes through it: Bash (`shell.exec`), file reads and edits
+    /// (`fs.read`, `fs.write`), web fetches (`web.fetch`, source `web`), sub-agents
+    /// (`agent.spawn`) and MCP tools (`<server>.<tool>`, source `mcp:<server>`). Calls in one
+    /// Claude Code session share a writ task in writd (started if needed). writ only narrows:
+    /// an allowed call is left to Claude Code's own permissions, `require_sudo` makes Claude
+    /// Code ask, and `deny` denies.
+    ClaudeCode {
+        /// Path to writ.yaml [default: $CLAUDE_PROJECT_DIR/writ.yaml].
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// The principal the session acts for (unverified).
+        #[arg(long)]
+        principal: Option<String>,
+        /// Flight recorder file, used if this starts writd.
+        #[arg(long)]
+        log: Option<PathBuf>,
     },
 }
 
@@ -216,6 +272,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             command,
         } => fork(policy.as_deref(), label.as_deref(), ttl, &command),
         Commands::Ps => ps(),
+        Commands::Init {
+            dir,
+            enforce,
+            force,
+            undo,
+        } => init::run(init::Options {
+            dir,
+            undo,
+            enforce,
+            force,
+        }),
+        Commands::Report { log, task } => report(log, task.as_deref()),
+        Commands::Hook {
+            target: HookTarget::ClaudeCode { policy, principal, log },
+        } => claude_code::run(policy.as_deref(), principal.as_deref(), log.as_deref()),
         Commands::Sudo { action } => sudo(action),
         Commands::Replay {
             policy,
@@ -654,6 +725,116 @@ fn sudo(action: SudoAction) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// `writ report`: what the policies decided, from the flight log.
+fn report(log: Option<PathBuf>, only: Option<&str>) -> Result<ExitCode> {
+    use std::collections::BTreeMap;
+    let path = log.unwrap_or_else(writ_recorder::default_log_path);
+    let entries = writ_recorder::read_entries(&path)?;
+    let mine = |e: &&Entry| only.is_none_or(|t| e.session == t || e.data["task"].as_str() == Some(t));
+
+    #[derive(Default)]
+    struct Row {
+        calls: u64,
+        allowed: u64,
+        human: u64,
+        denied: u64,
+        observed: u64,
+    }
+    let mut rows: BTreeMap<String, Row> = BTreeMap::new();
+    let mut tasks = std::collections::BTreeSet::new();
+    let mut notable = Vec::new();
+    let mut trifecta = 0;
+    for e in entries.iter().filter(|e| e.kind == "tool_call").filter(mine) {
+        let Ok(decision) = serde_json::from_value::<writ_policy::Decision>(e.data["decision"].clone()) else {
+            continue;
+        };
+        let tool = e.data["tool"].as_str().unwrap_or("?").to_string();
+        tasks.insert(e.data["task"].as_str().unwrap_or_default().to_string());
+        let row = rows.entry(tool.clone()).or_default();
+        row.calls += 1;
+        match decision.decided() {
+            writ_policy::Outcome::Allow => row.allowed += 1,
+            writ_policy::Outcome::RequireSudo => row.human += 1,
+            writ_policy::Outcome::Deny => row.denied += 1,
+        }
+        if decision.would.is_some() {
+            row.observed += 1;
+        }
+        if decision.decided() != writ_policy::Outcome::Allow {
+            if decision.reason.contains("is privileged and the task is tainted") {
+                trifecta += 1;
+            }
+            notable.push((e.seq, tool, decision, e.data["arguments"].clone()));
+        }
+    }
+    if rows.is_empty() {
+        println!("no decisions in {}", path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    let total: u64 = rows.values().map(|r| r.calls).sum();
+    let observed: u64 = rows.values().map(|r| r.observed).sum();
+    println!("{total} calls in {} task(s), from {}", tasks.len(), path.display());
+    if observed > 0 {
+        println!("{observed} would have been stopped, but weren't: their policy is in observe mode");
+    }
+    println!();
+    println!(
+        "{:<36} {:>6} {:>8} {:>11} {:>7} {:>9}",
+        "TOOL", "CALLS", "ALLOWED", "NEEDS HUMAN", "DENIED", "OBSERVED"
+    );
+    for (tool, r) in &rows {
+        println!(
+            "{:<36} {:>6} {:>8} {:>11} {:>7} {:>9}",
+            tool, r.calls, r.allowed, r.human, r.denied, r.observed
+        );
+    }
+
+    let taints: Vec<&Entry> = entries.iter().filter(|e| e.kind == "taint").filter(mine).collect();
+    if !taints.is_empty() {
+        println!();
+        println!("Untrusted content read:");
+        for t in taints {
+            println!(
+                "  #{:<6} task {} read from {} ({})",
+                t.seq,
+                t.data["task"].as_str().unwrap_or("?"),
+                t.data["source"].as_str().unwrap_or("?"),
+                t.data["tool"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if trifecta > 0 {
+        println!();
+        println!("{trifecta} privileged call(s) came after untrusted content: the pattern prompt injections exploit.");
+    }
+    if !notable.is_empty() {
+        println!();
+        println!(
+            "Calls the policy stopped or would have stopped (latest {}):",
+            notable.len().min(20)
+        );
+        for (seq, tool, d, args) in notable.iter().rev().take(20).rev() {
+            let what = ["command", "path", "url", "sql", "query"]
+                .iter()
+                .find_map(|k| args[k].as_str())
+                .map(|v| format!(" {}", truncate(v, 60)))
+                .unwrap_or_default();
+            let tag = if d.would.is_some() { " (observe)" } else { "" };
+            println!("  #{seq:<6} {}{tag}  {tool}{what}", d.decided().as_str().to_uppercase());
+            println!("          {}", truncate(&d.reason, 140));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
 }
 

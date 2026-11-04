@@ -46,7 +46,7 @@ pub struct Flip {
 impl Flip {
     /// True when the candidate policy is less restrictive for this call.
     pub fn loosens(&self) -> bool {
-        self.after.outcome < self.before.outcome
+        self.after.outcome < self.before.decided()
     }
 }
 
@@ -150,7 +150,8 @@ pub fn replay(
         if partial {
             report.partial += 1;
         }
-        if after.outcome != before.outcome {
+        // Observe-mode calls compare what the policy decided, not what was let through.
+        if after.outcome != before.decided() {
             report.flips.push(Flip {
                 seq: entry.seq,
                 ts: entry.ts.clone(),

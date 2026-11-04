@@ -83,6 +83,18 @@ enum Violation {
     RequireSudo,
 }
 
+/// Whether a policy's decisions are applied (`enforce`, the default) or only
+/// recorded (`observe`): in observe mode every call goes through and the log
+/// records what the policy would have decided, so a policy can be tried on
+/// real traffic before it blocks anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Enforce,
+    Observe,
+}
+
 /// Outcomes ordered from least to most restrictive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +114,10 @@ pub struct Decision {
     /// approval the call waits for (`writ sudo approve <id>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    /// In observe mode: what the policy decided, though `outcome` lets the
+    /// call through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would: Option<Outcome>,
 }
 
 impl Decision {
@@ -111,6 +127,22 @@ impl Decision {
             rule,
             reason,
             approval: None,
+            would: None,
+        }
+    }
+
+    /// What the policy decided: `would` in observe mode, else `outcome`.
+    pub fn decided(&self) -> Outcome {
+        self.would.unwrap_or(self.outcome)
+    }
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Allow => "allow",
+            Outcome::RequireSudo => "require_sudo",
+            Outcome::Deny => "deny",
         }
     }
 }
@@ -122,6 +154,12 @@ pub struct Approvals {
     /// How long a paused call waits before it is denied.
     pub timeout: Duration,
 }
+
+/// Sources other than MCP servers, as agent hooks name them (see
+/// `writ hook claude-code`): `web` (fetches and searches), `shell`, `fs`
+/// (the local filesystem), `agent` (sub-agents), `claude` (the agent's own
+/// bookkeeping tools).
+pub const BUILTIN_SOURCES: &[&str] = &["web", "shell", "fs", "agent", "claude"];
 
 /// The default `approvals.timeout`.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -157,6 +195,9 @@ struct Rule {
     record_arguments: bool,
     /// Guarded on tainted tasks (`data_flow.on_taint.privileged_mutations`).
     privileged: bool,
+    /// Says why, in words, when the rule refuses or escalates a call:
+    /// "agent configuration is protected". The technical reason follows.
+    reason: Option<String>,
 }
 
 /// How a call's arguments may appear in the flight recorder, merged across
@@ -176,6 +217,7 @@ impl Recording<'_> {
 pub struct Policy {
     pub namespace: String,
     pub enforcement: Enforcement,
+    pub mode: Mode,
     pub limits: Limits,
     /// Sources whose content may be attacker-written (`mcp:<name>`). An
     /// allowed call to one taints its task.
@@ -197,6 +239,8 @@ struct RawPolicy {
     namespace: String,
     #[serde(default)]
     enforcement: Enforcement,
+    #[serde(default)]
+    mode: Mode,
     #[serde(default)]
     limits: RawLimits,
     #[serde(default)]
@@ -291,6 +335,8 @@ struct RawRule {
     record_arguments: bool,
     #[serde(default)]
     privileged: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -322,9 +368,13 @@ impl Policy {
         }
 
         for source in &raw.data_flow.untrusted_sources {
+            if BUILTIN_SOURCES.contains(&source.as_str()) {
+                continue;
+            }
             let name = source.strip_prefix("mcp:").ok_or_else(|| {
                 invalid(format!(
-                    "untrusted source `{source}`: only MCP servers (`mcp:<name>`) are supported in this build"
+                    "untrusted source `{source}`: use an MCP server (`mcp:<name>`) or one of {}",
+                    BUILTIN_SOURCES.join(", ")
                 ))
             })?;
             validate_session_name(name).map_err(|e| invalid(format!("untrusted source `{source}`: {e}")))?;
@@ -346,6 +396,7 @@ impl Policy {
         Ok(Policy {
             namespace: raw.namespace,
             enforcement: raw.enforcement,
+            mode: raw.mode,
             untrusted_sources: raw.data_flow.untrusted_sources,
             on_taint_privileged: match raw.data_flow.on_taint.privileged_mutations {
                 TaintAction::RequireSudo => Outcome::RequireSudo,
@@ -543,12 +594,28 @@ impl Rule {
             redact,
             record_arguments: raw.record_arguments,
             privileged: raw.privileged,
+            reason: raw.reason,
         })
     }
 
     /// Decides the call under this rule alone. The flag is true when the rule
     /// has entitlements and they all held (the call is *covered*).
     fn decide(&self, base: &Scope, source: Option<&dyn EntitlementSource>, recording: &Recording) -> (Decision, bool) {
+        let (mut decision, covered) = self.decide_inner(base, source, recording);
+        if let Some(why) = &self.reason
+            && decision.outcome != Outcome::Allow
+        {
+            decision.reason = format!("{why}: {}", decision.reason);
+        }
+        (decision, covered)
+    }
+
+    fn decide_inner(
+        &self,
+        base: &Scope,
+        source: Option<&dyn EntitlementSource>,
+        recording: &Recording,
+    ) -> (Decision, bool) {
         let rule = Some(self.pattern.clone());
         if self.action == Action::Deny {
             let reason = format!("denied by rule `{}`", self.pattern);

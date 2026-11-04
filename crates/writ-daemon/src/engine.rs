@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use writ_policy::{
-    Decision, DecisionContext, EntitlementSource, Facts, FileSource, Outcome, Policy, Root, SessionFacts,
+    Decision, DecisionContext, EntitlementSource, Facts, FileSource, Mode, Outcome, Policy, Root, SessionFacts,
 };
 use writ_recorder::{Recorder, RecorderError};
 
@@ -228,6 +228,52 @@ struct Session {
     /// The `writ wrap` process serving this session, if known. It and its
     /// descendants (the MCP server) must not decide the task's approvals.
     pid: Option<i32>,
+    /// The caller asks its own human for `require_sudo` (a Claude Code
+    /// prompt), so writd doesn't pause the call.
+    ask_natively: bool,
+}
+
+/// How long a scope (see [`Engine::decide_scoped`]) lives without a call.
+pub const SCOPE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One action from a caller that keeps no connection: see
+/// [`Engine::decide_scoped`].
+#[derive(Debug, Clone)]
+pub struct ScopedCall {
+    /// Which calls share a task, e.g. `claude-code:<session id>`.
+    pub scope: String,
+    pub policy: LoadedPolicy,
+    pub entitlements: Option<LoadedEntitlements>,
+    /// `writ.workspace`, an absolute path.
+    pub workspace: Option<String>,
+    pub principal: Option<String>,
+    /// Where the action goes: `shell`, `fs`, `web`, `mcp:<server>`, ...
+    pub source: String,
+    pub tool: String,
+    pub args: Value,
+    pub call_id: Value,
+}
+
+struct ScopeState {
+    task: String,
+    policy_sha256: String,
+    /// Session per source.
+    sessions: BTreeMap<String, String>,
+    last_used: Instant,
+}
+
+/// A scoped call's source: 1-80 characters from `[A-Za-z0-9_.:-]`.
+fn validate_source(source: &str) -> Result<(), EngineError> {
+    let ok = !source.is_empty()
+        && source.len() <= 80
+        && source
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(EngineError::Invalid(format!("invalid source `{source}`")))
+    }
 }
 
 /// One row of `writ ps`.
@@ -263,12 +309,15 @@ pub struct Engine {
     sessions: BTreeMap<String, Session>,
     /// Signs task tokens. Its key lives only in this process.
     issuer: Issuer,
+    /// Tasks of callers that keep no connection, by scope.
+    scopes: BTreeMap<String, ScopeState>,
 }
 
 impl Engine {
     pub fn new(recorder: Recorder) -> Self {
         Engine {
             issuer: Issuer::default(),
+            scopes: BTreeMap::new(),
             recorder,
             approvals_enabled: false,
             approvals: BTreeMap::new(),
@@ -400,6 +449,11 @@ impl Engine {
                         "{name} declares an entitlement source; a fork reads the task's"
                     )));
                 }
+                if policy.policy.mode == Mode::Observe {
+                    return Err(EngineError::Invalid(format!(
+                        "{name} is in observe mode, which only a task's policy can be"
+                    )));
+                }
                 check_tables(&policy.policy, task.source.as_deref())?;
                 narrowing.push(Narrowing {
                     policy,
@@ -519,7 +573,9 @@ impl Engine {
             expires: None,
             lineage: Value::Null,
         });
-        self.open(grant, own_policy, own_entitlements, name, info)
+        writ_policy::validate_session_name(name).map_err(EngineError::Invalid)?;
+        let source = writ_policy::session_source(name);
+        self.open(grant, own_policy, own_entitlements, source, info)
     }
 
     /// Like [`Engine::open_session`] with a task, but the task comes from a
@@ -533,7 +589,9 @@ impl Engine {
         info: Value,
     ) -> Result<String, EngineError> {
         let grant = self.grant(token)?;
-        self.open(Some(grant), own_policy, own_entitlements, name, info)
+        writ_policy::validate_session_name(name).map_err(EngineError::Invalid)?;
+        let source = writ_policy::session_source(name);
+        self.open(Some(grant), own_policy, own_entitlements, source, info)
     }
 
     fn open(
@@ -541,11 +599,9 @@ impl Engine {
         grant: Option<Grant>,
         mut own_policy: Option<LoadedPolicy>,
         own_entitlements: Option<LoadedEntitlements>,
-        name: &str,
+        source: String,
         info: Value,
     ) -> Result<String, EngineError> {
-        writ_policy::validate_session_name(name).map_err(EngineError::Invalid)?;
-        let source = writ_policy::session_source(name);
         let (task_id, mut narrowing, forks, expires, lineage) = match grant {
             Some(grant) => {
                 let id = &grant.task;
@@ -557,6 +613,11 @@ impl Engine {
                     return Err(EngineError::Invalid(format!("task `{id}` has ended")));
                 }
                 if let Some(own) = &own_policy {
+                    if own.policy.mode == Mode::Observe {
+                        return Err(EngineError::Invalid(
+                            "observe mode applies to a task's policy, not a narrowing one".into(),
+                        ));
+                    }
                     // Narrowing can't bring its own source: that could widen what the
                     // root is entitled to. It reads the task's.
                     if own.policy.entitlements.is_some() || own_entitlements.is_some() {
@@ -615,9 +676,133 @@ impl Engine {
                 expires,
                 counters: Counters::default(),
                 pid: None,
+                ask_natively: false,
             },
         );
         Ok(id)
+    }
+
+    /// Decides one action for a caller that keeps no connection open: a
+    /// Claude Code hook runs as a fresh process for every tool call. Calls
+    /// with the same `scope` (e.g. `claude-code:<session id>`) share one task,
+    /// so taint and limits carry from call to call, with a session per
+    /// source (`shell`, `web`, `mcp:github`, ...). If the policy text changes,
+    /// the scope moves to a new task and keeps its taint: editing the policy
+    /// doesn't launder an injection. Scopes idle for [`SCOPE_IDLE`] end.
+    ///
+    /// `require_sudo` is returned as is, never paused: the caller asks its
+    /// own human (Claude Code's permission prompt).
+    pub fn decide_scoped(&mut self, call: ScopedCall) -> Result<Decision, EngineError> {
+        let session = self.scoped_session(&call)?;
+        self.decide(&session, &call.call_id, &call.tool, &call.args)
+    }
+
+    /// Records that a scoped call ran (after Claude Code asked its user, say),
+    /// and taints the task if its source is untrusted: its output is now in
+    /// the agent's context.
+    pub fn executed_scoped(&mut self, call: ScopedCall) -> Result<(), EngineError> {
+        let session = self.scoped_session(&call)?;
+        self.taint_if_untrusted(&session, &call.call_id, &call.tool)?;
+        self.recorder.append(
+            &session,
+            "tool_executed",
+            json!({ "id": call.call_id, "tool": call.tool, "task": self.sessions[&session].task }),
+        )?;
+        Ok(())
+    }
+
+    fn scoped_session(&mut self, call: &ScopedCall) -> Result<String, EngineError> {
+        validate_source(&call.source)?;
+        self.sweep_idle_scopes();
+        let current = self
+            .scopes
+            .get(&call.scope)
+            .filter(|s| s.policy_sha256 == call.policy.sha256 && self.tasks.get(&s.task).is_some_and(|t| !t.ended))
+            .map(|s| s.task.clone());
+        let task_id = match current {
+            Some(task) => task,
+            None => {
+                let previous = self.scopes.remove(&call.scope);
+                let mut carried = (false, Vec::new());
+                if let Some(old) = &previous
+                    && let Some(task) = self.tasks.get(&old.task)
+                {
+                    carried = (task.facts.tainted, task.facts.taint_sources.clone());
+                }
+                let meta = json!({
+                    "scope": call.scope,
+                    "workspace": call.workspace,
+                    "replaces": previous.as_ref().map(|p| &p.task),
+                    "carried_taint": carried.1,
+                });
+                let authority = Authority {
+                    principal: call.principal.clone(),
+                    entitlements: call.entitlements.clone(),
+                };
+                let task = self.create_task(call.policy.clone(), authority, meta)?;
+                let facts = &mut self.tasks.get_mut(&task).expect("just created").facts;
+                facts.workspace = call.workspace.clone();
+                (facts.tainted, facts.taint_sources) = carried;
+                if let Some(old) = previous {
+                    for session in old.sessions.values() {
+                        let _ = self.close_session(session, json!({ "termination": "policy changed" }));
+                    }
+                    let _ = self.end_task(&old.task, "policy changed");
+                }
+                self.scopes.insert(
+                    call.scope.clone(),
+                    ScopeState {
+                        task: task.clone(),
+                        policy_sha256: call.policy.sha256.clone(),
+                        sessions: BTreeMap::new(),
+                        last_used: Instant::now(),
+                    },
+                );
+                task
+            }
+        };
+        let scope = self.scopes.get_mut(&call.scope).expect("scope exists");
+        scope.last_used = Instant::now();
+        if let Some(session) = scope.sessions.get(&call.source) {
+            return Ok(session.clone());
+        }
+        let grant = Grant {
+            task: task_id,
+            narrowing: Vec::new(),
+            forks: Vec::new(),
+            expires: None,
+            lineage: Value::Null,
+        };
+        let session = self.open(
+            Some(grant),
+            None,
+            None,
+            call.source.clone(),
+            json!({ "scope": call.scope }),
+        )?;
+        self.sessions.get_mut(&session).expect("just opened").ask_natively = true;
+        self.scopes
+            .get_mut(&call.scope)
+            .expect("scope exists")
+            .sessions
+            .insert(call.source.clone(), session.clone());
+        Ok(session)
+    }
+
+    fn sweep_idle_scopes(&mut self) {
+        let idle: Vec<String> = self
+            .scopes
+            .iter()
+            .filter(|(_, s)| s.last_used.elapsed() > SCOPE_IDLE)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in idle {
+            let scope = self.scopes.remove(&key).expect("listed");
+            for session in scope.sessions.values() {
+                let _ = self.close_session(session, json!({ "termination": "idle" }));
+            }
+            let _ = self.end_task(&scope.task, "idle");
+        }
     }
 
     /// Decides one tool call and records the decision before returning it.
@@ -646,13 +831,14 @@ impl Engine {
             ..task.facts.clone()
         };
         let ctx = DecisionContext::new(tool, args, &facts).with_source(task.source.as_deref());
+        let expired = session.expires.is_some_and(|e| token::now() > e);
         let mut decision = if task.ended {
             Decision::new(
                 Outcome::Deny,
                 None,
                 format!("task `{}` has ended; its authority is revoked", session.task),
             )
-        } else if session.expires.is_some_and(|e| token::now() > e) {
+        } else if expired {
             Decision::new(
                 Outcome::Deny,
                 None,
@@ -678,8 +864,23 @@ impl Engine {
             decision.outcome = Outcome::Deny;
             decision.reason = reason;
         }
+        // Observe mode records what the policy decided and lets the call through.
+        // Revocation (an ended task, an expired token) isn't policy: it still denies.
+        if task.policy.policy.mode == Mode::Observe && !task.ended && !expired && decision.outcome != Outcome::Allow {
+            let would = decision.outcome;
+            decision = Decision {
+                outcome: Outcome::Allow,
+                reason: format!(
+                    "observe mode, not enforced: would {}: {}",
+                    would.as_str(),
+                    decision.reason
+                ),
+                would: Some(would),
+                ..decision
+            };
+        }
         // Pause for a human instead of refusing, if this task can be asked.
-        let timeout = approval_timeout(task, session).filter(|_| self.approvals_enabled);
+        let timeout = approval_timeout(task, session).filter(|_| self.approvals_enabled && !session.ask_natively);
         if decision.outcome == Outcome::RequireSudo && timeout.is_some() {
             decision.approval = Some(new_id("apr"));
         }

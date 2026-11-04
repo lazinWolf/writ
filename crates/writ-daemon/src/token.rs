@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use biscuit_auth::builder::{self, Term};
-use biscuit_auth::{AuthorizerBuilder, Biscuit, BlockBuilder, KeyPair, UnverifiedBiscuit};
+use biscuit_auth::{AuthorizerBuilder, AuthorizerLimits, Biscuit, BlockBuilder, KeyPair, UnverifiedBiscuit};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -145,6 +145,12 @@ impl Issuer {
             .map_err(|e| TokenError::Signature(e.to_string()))?;
 
         let mut authorizer = AuthorizerBuilder::new()
+            // Biscuit's default budget is 1ms, which a loaded machine (or a debug
+            // build) can miss. Still bounded: a fork block's Datalog is the forker's.
+            .set_limits(AuthorizerLimits {
+                max_time: Duration::from_millis(250),
+                ..AuthorizerLimits::default()
+            })
             .time()
             .code("allow if true;")
             .map_err(internal)?

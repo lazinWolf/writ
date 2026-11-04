@@ -203,6 +203,14 @@ impl Connection {
                 engine.close_session(&session, data)?;
                 Ok(Value::Null)
             }
+            Request::Check(call) => {
+                let decision = engine.decide_scoped(scoped(call)?)?;
+                Ok(serde_json::to_value(decision).expect("decision serializes"))
+            }
+            Request::Executed(call) => {
+                engine.executed_scoped(scoped(call)?)?;
+                Ok(Value::Null)
+            }
             Request::Ps => Ok(json!({ "tasks": engine.tasks() })),
             Request::ListApprovals => Ok(json!({ "approvals": engine.approvals() })),
             Request::ResolveApproval {
@@ -243,6 +251,24 @@ impl Connection {
     fn session(&self) -> Result<&str, EngineError> {
         self.session.as_deref().ok_or_else(no_session)
     }
+}
+
+fn scoped(call: crate::protocol::ScopedRequest) -> Result<crate::engine::ScopedCall, EngineError> {
+    Ok(crate::engine::ScopedCall {
+        policy: LoadedPolicy::parse(&call.policy)?,
+        entitlements: call
+            .entitlements
+            .as_deref()
+            .map(LoadedEntitlements::parse)
+            .transpose()?,
+        scope: call.scope,
+        workspace: call.workspace,
+        principal: call.principal,
+        source: call.source,
+        tool: call.tool,
+        args: call.args,
+        call_id: call.call_id,
+    })
 }
 
 fn no_session() -> EngineError {

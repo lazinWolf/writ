@@ -2,11 +2,20 @@
 //!
 //! - A path starts with `args.` (the call's arguments) or `writ.` (facts about
 //!   the task, see [`crate::Facts`]): `args.amount`, `writ.root.principal`.
-//! - `op` is one of `<`, `<=`, `>`, `>=`, `==`, `!=`, or `in`.
+//! - `op` is one of `<`, `<=`, `>`, `>=`, `==`, `!=`, `in`, `matches`,
+//!   `not matches`, or `within`.
 //! - The operand is a JSON literal (`100.00`, `"usd"`, `true`, `null`; an
-//!   array only after `in`) or another path:
+//!   array only after `in`, `matches`, `not matches` and `within`) or
+//!   another path:
 //!   `args.amount <= writ.root.refund_limit`,
 //!   `args.customer in writ.root.entitled_customers`.
+//! - `matches` takes a glob or a list of globs (`*` matches anything,
+//!   including `/`): `args.command not matches ["terraform destroy*", "rm -rf /*"]`.
+//!   A list on the left matches if any element does, so `not matches` holds
+//!   only if none does.
+//! - `within` takes a directory or a list of them, and holds when the left
+//!   side is an absolute path inside one, after `.` and `..` are resolved
+//!   lexically: `args.path within writ.workspace`. Symlinks aren't followed.
 //!
 //! Evaluation fails closed: a missing path or a type mismatch makes the
 //! condition fail rather than pass.
@@ -27,6 +36,9 @@ pub enum Op {
     Eq,
     Ne,
     In,
+    Matches,
+    NotMatches,
+    Within,
 }
 
 impl Op {
@@ -39,11 +51,19 @@ impl Op {
             Op::Eq => "==",
             Op::Ne => "!=",
             Op::In => "in",
+            Op::Matches => "matches",
+            Op::NotMatches => "not matches",
+            Op::Within => "within",
         }
     }
 
     fn is_ordering(self) -> bool {
         matches!(self, Op::Lt | Op::Le | Op::Gt | Op::Ge)
+    }
+
+    /// Operators whose right side is a string or a list of strings.
+    fn takes_patterns(self) -> bool {
+        matches!(self, Op::Matches | Op::NotMatches | Op::Within)
     }
 }
 
@@ -136,11 +156,21 @@ impl Condition {
             .iter()
             .find_map(|(sym, op)| rest.strip_prefix(sym).map(|r| (*op, r)))
             .or_else(|| {
-                rest.strip_prefix("in")
-                    .filter(|r| r.starts_with(char::is_whitespace))
-                    .map(|r| (Op::In, r))
+                let words = [
+                    ("not matches", Op::NotMatches),
+                    ("matches", Op::Matches),
+                    ("within", Op::Within),
+                    ("in", Op::In),
+                ];
+                words.iter().find_map(|(word, op)| {
+                    rest.strip_prefix(word)
+                        .filter(|r| r.starts_with(char::is_whitespace))
+                        .map(|r| (*op, r))
+                })
             })
-            .ok_or_else(|| "expected one of <, <=, >, >=, ==, !=, in after the path".to_string())?;
+            .ok_or_else(|| {
+                "expected one of <, <=, >, >=, ==, !=, in, matches, not matches, within after the path".to_string()
+            })?;
 
         let rest = rest.trim();
         let rhs = match parse_path(rest, bindings) {
@@ -156,6 +186,11 @@ impl Condition {
                     format!("right-hand side `{rest}` is not a path or a JSON literal (use \"quoted\" strings)")
                 })?;
                 match (op, &literal) {
+                    (op, v) if op.takes_patterns() => {
+                        if strings(v).is_none() {
+                            return Err(format!("`{}` needs a string or a list of strings", op.symbol()));
+                        }
+                    }
                     (Op::In, Value::Array(items)) if items.iter().all(is_scalar) => {}
                     (Op::In, _) => return Err("`in` needs an array of scalars or a path".to_string()),
                     (_, v) if !is_scalar(v) => {
@@ -207,6 +242,19 @@ impl Condition {
                         .as_array()
                         .is_some_and(|items| items.iter().any(|i| equal(left, i)))
             }
+            Op::Matches | Op::NotMatches => match (strings(left), strings(right)) {
+                (Some(subjects), Some(globs)) => {
+                    let any = subjects
+                        .iter()
+                        .any(|s| globs.iter().any(|g| crate::glob::matches(g, s)));
+                    any == (self.op == Op::Matches)
+                }
+                _ => false,
+            },
+            Op::Within => match (left.as_str(), strings(right)) {
+                (Some(path), Some(dirs)) => within(path, &dirs),
+                _ => false,
+            },
             Op::Eq => equal(left, right),
             // Type mismatch fails even for `!=`.
             Op::Ne => same_scalar_type(left, right) && !equal(left, right),
@@ -225,6 +273,42 @@ impl Condition {
 
 fn is_scalar(v: &Value) -> bool {
     !(v.is_array() || v.is_object())
+}
+
+/// A string, or a non-empty list of strings, as a list; anything else is `None`.
+fn strings(v: &Value) -> Option<Vec<&str>> {
+    match v {
+        Value::String(s) => Some(vec![s.as_str()]),
+        Value::Array(items) if !items.is_empty() => items.iter().map(Value::as_str).collect(),
+        _ => None,
+    }
+}
+
+/// Resolves `.` and `..` in an absolute path without touching the
+/// filesystem. `None` for a relative path, which can't be placed.
+pub(crate) fn normalize_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
+/// True when `path` is one of `dirs` or inside one.
+fn within(path: &str, dirs: &[&str]) -> bool {
+    let Some(path) = normalize_path(path) else { return false };
+    dirs.iter()
+        .filter_map(|d| normalize_path(d))
+        .any(|dir| dir == "/" || path == dir || path.strip_prefix(&dir).is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// Orders two numbers; anything else is incomparable, so the condition fails.
@@ -251,7 +335,7 @@ fn op_holds(op: Op, ord: Ordering) -> bool {
         Op::Le => ord != Ordering::Greater,
         Op::Gt => ord == Ordering::Greater,
         Op::Ge => ord != Ordering::Less,
-        Op::Eq | Op::Ne | Op::In => unreachable!("not an ordering"),
+        _ => unreachable!("not an ordering"),
     }
 }
 
@@ -380,6 +464,44 @@ mod tests {
     }
 
     #[test]
+    fn globs() {
+        let destructive = r#"args.command not matches ["terraform destroy*", "*rm -rf /*"]"#;
+        assert!(check(destructive, json!({"command": "terraform plan"})).is_ok());
+        assert!(check(destructive, json!({"command": "terraform destroy -auto-approve"})).is_err());
+        assert!(check(destructive, json!({"command": "cd x && rm -rf /"})).is_err());
+        assert!(check("args.path matches \"*/.mcp.json\"", json!({"path": "/w/.mcp.json"})).is_ok());
+        // A list on the left: `not matches` holds only if no element matches.
+        assert!(check("args.argv not matches \"--force*\"", json!({"argv": ["git", "push"]})).is_ok());
+        assert!(
+            check(
+                "args.argv not matches \"--force*\"",
+                json!({"argv": ["git", "push", "--force"]})
+            )
+            .is_err()
+        );
+        // Missing or not a string: fail closed, for `not matches` too.
+        assert!(check("args.path not matches \"*.env\"", json!({})).is_err());
+        assert!(check("args.path not matches \"*.env\"", json!({"path": 3})).is_err());
+    }
+
+    #[test]
+    fn paths_within() {
+        let facts = Facts {
+            workspace: Some("/home/a/proj".into()),
+            ..Facts::default()
+        };
+        let inside = "args.path within writ.workspace";
+        assert!(check_with(inside, json!({"path": "/home/a/proj/src/x.rs"}), &facts).is_ok());
+        assert!(check_with(inside, json!({"path": "/home/a/proj"}), &facts).is_ok());
+        assert!(check_with(inside, json!({"path": "/home/a/proj/../other/x"}), &facts).is_err());
+        assert!(check_with(inside, json!({"path": "/home/a/project2/x"}), &facts).is_err());
+        // Relative paths can't be placed; no workspace fact: fail closed.
+        assert!(check_with(inside, json!({"path": "src/x.rs"}), &facts).is_err());
+        assert!(check(inside, json!({"path": "/home/a/proj/x"})).is_err());
+        assert!(check("args.p within [\"/tmp\", \"/var/tmp\"]", json!({"p": "/var/tmp/a"})).is_ok());
+    }
+
+    #[test]
     fn parse_errors() {
         for bad in [
             "charge.customer == 1",
@@ -394,6 +516,10 @@ mod tests {
             "args.a == [1]",
             "args.a == args.b extra",
             "args.a inx [1]",
+            "args.a matches 3",
+            "args.a matches []",
+            "args.a within [1]",
+            "args.a matchesx \"b\"",
         ] {
             assert!(Condition::parse(bad).is_err(), "accepted: {bad}");
         }

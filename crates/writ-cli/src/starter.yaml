@@ -1,0 +1,79 @@
+# writ policy for this project, written by `writ init`.
+#
+# It starts in observe mode: nothing is blocked, and the flight log records
+# what this policy would have decided. Run `writ report` to see that, adjust
+# the rules, then change `mode: observe` to `mode: enforce`. Before enforcing
+# a change, `writ replay --policy writ.yaml` shows which past calls it would
+# decide differently.
+#
+# Under Claude Code, tools are named: shell.exec (Bash), fs.read, fs.write
+# (Write, Edit, NotebookEdit), fs.search (Glob, Grep), web.fetch, web.search,
+# agent.spawn (sub-agents), <server>.<tool> for MCP tools, and claude.<Tool>
+# for the rest. writ only narrows: anything it allows is still subject to
+# Claude Code's own permission settings.
+version: 1
+namespace: {namespace}
+mode: observe
+
+data_flow:
+  # Content an attacker may have written. Once the session reads from one of
+  # these, privileged calls need a human (Claude Code asks you). Add MCP
+  # servers that return outside content: "mcp:github", "mcp:zendesk", ...
+  untrusted_sources: ["web"]
+  on_taint:
+    privileged_mutations: require_sudo
+
+capabilities:
+  # Claude Code's bookkeeping (todos, plan mode) and sub-agents.
+  - tool: "claude.*"
+  - tool: "agent.spawn"
+
+  # Reading and searching.
+  - tool: "fs.read"
+  - tool: "fs.search"
+  - tool: "web.search"
+  - tool: "web.fetch"
+
+  # Self-protection: the agent may not rewrite what controls it. Editing MCP
+  # or Claude Code settings is how CurXecute (CVE-2025-54135) and
+  # CVE-2025-53773 turned a prompt injection into code execution.
+  - tool: "fs.write"
+    reason: "agent and MCP configuration is protected"
+    conditions:
+      - 'args.path not matches ["*/.mcp.json", "*/.claude/settings.json", "*/.claude/settings.local.json", "*/.cursor/mcp.json", "*/.vscode/settings.json", "*/.vscode/mcp.json", "*/writ.yaml"]'
+    on_violation: deny
+  # The same files through the shell (`echo {} > .mcp.json`). Reading them
+  # is fine, so a human decides.
+  - tool: "shell.exec"
+    reason: "the command touches agent or MCP configuration"
+    conditions:
+      - 'args.command not matches ["*.mcp.json*", "*.claude/settings*", "*.cursor/mcp.json*", "*.vscode/settings.json*", "*.vscode/mcp.json*", "*writ.yaml*"]'
+    on_violation: require_sudo
+  # Instructions the agent reads every session: a human confirms changes.
+  - tool: "fs.write"
+    reason: "this file instructs the agent in every session"
+    conditions:
+      - 'args.path not matches ["*/CLAUDE.md", "*/AGENTS.md", "*/.cursorrules", "*/.github/copilot-instructions.md"]'
+    on_violation: require_sudo
+  # Writes stay in the project, and need a human after reading untrusted content.
+  - tool: "fs.write"
+    privileged: true
+    reason: "the file is outside the project"
+    conditions:
+      - "args.path within writ.workspace"
+    on_violation: require_sudo
+
+  # Shell. A command can send data anywhere, so after reading untrusted
+  # content every command needs a human. Destructive ones always do.
+  - tool: "shell.exec"
+    privileged: true
+    reason: "destructive command"
+    conditions:
+      - 'args.command not matches ["*rm -rf /*", "*rm -rf ~*", "*rm -rf $HOME*", "*git push --force*", "*git push -f *", "*git reset --hard*", "*terraform destroy*", "*terraform apply*", "*tofu destroy*", "*kubectl delete*", "*helm uninstall*", "*DROP TABLE*", "*drop table*", "*DROP DATABASE*", "*TRUNCATE*", "*aws * delete-*", "*aws s3 rm*", "*gcloud * delete*", "*az * delete*", "*mkfs*", "*dd if=*"]'
+    on_violation: require_sudo
+
+  # Everything else, MCP tools included: allowed, but privileged once the
+  # session has read untrusted content. List your MCP servers' read-only
+  # tools above without `privileged` to keep them flowing.
+  - tool: "*"
+    privileged: true

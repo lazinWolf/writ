@@ -157,6 +157,17 @@ impl Client {
         string_field(&body, "session")
     }
 
+    /// Decides one action without a session (see `Request::Check`).
+    pub fn check(&mut self, call: crate::protocol::ScopedRequest) -> Result<Decision> {
+        Ok(serde_json::from_value(self.request(&Request::Check(call))?)?)
+    }
+
+    /// Records that a checked action ran (see `Request::Executed`).
+    pub fn executed(&mut self, call: crate::protocol::ScopedRequest) -> Result<()> {
+        self.request(&Request::Executed(call))?;
+        Ok(())
+    }
+
     pub fn decide(&mut self, call_id: &Value, tool: &str, args: &Value) -> Result<Decision> {
         let body = self.request(&Request::Decide {
             call_id: call_id.clone(),
